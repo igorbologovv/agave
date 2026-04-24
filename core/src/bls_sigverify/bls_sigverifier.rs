@@ -2,8 +2,10 @@
 
 use {
     super::{
-        bls_cert_sigverify::{CertPayload, verify_and_send_certificates},
-        bls_vote_sigverify::{VotePayload, verify_and_send_votes},
+        bls_cert_sigverify::{
+            verify_and_send_certificates, CertPayload, CertWorkerResult,
+        },
+        bls_vote_sigverify::{verify_and_send_votes, VotePayload},
         errors::SigVerifyError,
         stats::SigVerifierStats,
     },
@@ -18,7 +20,7 @@ use {
         migration::MigrationStatus,
         reward_certificate::AddVoteMessage,
     },
-    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError},
+    crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError},
     rayon::{ThreadPool, ThreadPoolBuilder},
     solana_bls_signatures::pubkey::PubkeyAffine as BlsPubkeyAffine,
     solana_clock::Slot,
@@ -31,11 +33,11 @@ use {
     std::{
         collections::HashSet,
         sync::{
-            Arc,
             atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
         },
         thread::{self, Builder},
-        time::Duration,
+        time::{Duration, Instant},
     },
 };
 
@@ -46,10 +48,10 @@ use {
 pub(super) const NUM_SLOTS_FOR_VERIFY: Slot = 90_000;
 
 /// If we receive an invalid certificate or vote from a QUIC connection, we ban the sender.
-/// We ban the sender for 2 days which roughly corresponds to an epoch
+/// We ban the sender for 2 days which roughly corresponds to an epoch.
 pub(super) const BAN_TIMEOUT: Duration = Duration::from_hours(48);
 
-pub(crate) struct SigVerifierContext {
+pub struct SigVerifierContext {
     pub(crate) migration_status: Arc<MigrationStatus>,
     pub(crate) banlist: Arc<SimpleQosBanlist>,
     pub(crate) sharable_banks: SharableBanks,
@@ -59,12 +61,92 @@ pub(crate) struct SigVerifierContext {
     pub(crate) generated_cert_types: Arc<GeneratedCertTypes>,
 }
 
-pub(crate) struct SigVerifierChannels {
+impl SigVerifierContext {
+    pub fn new(
+        migration_status: Arc<MigrationStatus>,
+        banlist: Arc<SimpleQosBanlist>,
+        sharable_banks: SharableBanks,
+        cluster_info: Arc<ClusterInfo>,
+        leader_schedule: Arc<LeaderScheduleCache>,
+        num_threads: usize,
+        generated_cert_types: Arc<GeneratedCertTypes>,
+    ) -> Self {
+        Self {
+            migration_status,
+            banlist,
+            sharable_banks,
+            cluster_info,
+            leader_schedule,
+            num_threads,
+            generated_cert_types,
+        }
+    }
+}
+
+pub struct SigVerifierChannels {
     pub(crate) packet_receiver: Receiver<PacketBatch>,
     pub(crate) channel_to_repair: VerifiedVoterSlotsSender,
     pub(crate) channel_to_reward: Sender<AddVoteMessage>,
     pub(crate) channel_to_pool: Sender<Vec<ConsensusMessage>>,
     pub(crate) channel_to_metrics: ConsensusMetricsEventSender,
+}
+
+impl SigVerifierChannels {
+    pub fn new(
+        packet_receiver: Receiver<PacketBatch>,
+        channel_to_repair: VerifiedVoterSlotsSender,
+        channel_to_reward: Sender<AddVoteMessage>,
+        channel_to_pool: Sender<Vec<ConsensusMessage>>,
+        channel_to_metrics: ConsensusMetricsEventSender,
+    ) -> Self {
+        Self {
+            packet_receiver,
+            channel_to_repair,
+            channel_to_reward,
+            channel_to_pool,
+            channel_to_metrics,
+        }
+    }
+}
+
+type CertJobResult = Result<CertWorkerResult, SigVerifyError>;
+
+#[derive(Default, Debug)]
+struct CertThreadMetrics {
+    cert_worker_idle_us: u64,
+    cert_worker_active_us: u64,
+    main_wait_for_cert_us: u64,
+    cert_jobs: u64,
+    certs_processed: u64,
+}
+
+struct CertJob {
+    certs_to_verify: Vec<CertPayload>,
+    root_bank: Arc<Bank>,
+    banlist: Arc<SimpleQosBanlist>,
+    channel_to_pool: Sender<Vec<ConsensusMessage>>,
+    metrics: Arc<Mutex<CertThreadMetrics>>,
+    reply: Sender<CertJobResult>,
+}
+
+enum CertWorkerMsg {
+    Job(CertJob),
+    Shutdown,
+}
+
+struct CertWorkerHandle {
+    tx: Sender<CertWorkerMsg>,
+    join_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl CertWorkerHandle {
+    fn shutdown(&mut self) {
+        let _ = self.tx.send(CertWorkerMsg::Shutdown);
+
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
+    }
 }
 
 /// Starts the BLS sigverifier service in its own dedicated thread.
@@ -81,7 +163,7 @@ pub(crate) fn spawn_service(
         .unwrap()
 }
 
-struct SigVerifier {
+pub struct SigVerifier {
     migration_status: Arc<MigrationStatus>,
     banlist: Arc<SimpleQosBanlist>,
     channels: SigVerifierChannels,
@@ -94,13 +176,71 @@ struct SigVerifier {
     last_checked_root_slot: Slot,
     cluster_info: Arc<ClusterInfo>,
     leader_schedule: Arc<LeaderScheduleCache>,
-    /// thread pool to use for all parallel tasks
+    /// Shared thread pool for vote-side parallel work.
     thread_pool: ThreadPool,
+    /// Dedicated long-lived thread for certificate-side processing.
+    cert_worker: CertWorkerHandle,
+    /// Internal metrics used while evaluating the dedicated cert-thread experiment.
+    cert_thread_metrics: Arc<Mutex<CertThreadMetrics>>,
     generated_cert_types: Arc<GeneratedCertTypes>,
 }
 
+fn spawn_cert_worker() -> CertWorkerHandle {
+    let (tx, rx) = bounded::<CertWorkerMsg>(1);
+
+    let join_handle = Builder::new()
+        .name("solSigVerCert".to_string())
+        .spawn(move || {
+            let mut idle_start = Instant::now();
+
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    CertWorkerMsg::Job(job) => {
+                        let idle_us = idle_start.elapsed().as_micros() as u64;
+
+                        {
+                            let mut metrics = job.metrics.lock().unwrap();
+                            metrics.cert_worker_idle_us += idle_us;
+                            metrics.cert_jobs += 1;
+                            metrics.certs_processed += job.certs_to_verify.len() as u64;
+                        }
+
+                        let active_start = Instant::now();
+
+                        let result = verify_and_send_certificates(
+                            job.certs_to_verify,
+                            &job.root_bank,
+                            &job.channel_to_pool,
+                            &job.banlist,
+                        )
+                        .map_err(SigVerifyError::from);
+
+                        let active_us = active_start.elapsed().as_micros() as u64;
+
+                        {
+                            let mut metrics = job.metrics.lock().unwrap();
+                            metrics.cert_worker_active_us += active_us;
+                        }
+
+                        let _ = job.reply.send(result);
+                        idle_start = Instant::now();
+                    }
+                    CertWorkerMsg::Shutdown => {
+                        break;
+                    }
+                }
+            }
+        })
+        .unwrap();
+
+    CertWorkerHandle {
+        tx,
+        join_handle: Some(join_handle),
+    }
+}
+
 impl SigVerifier {
-    fn new(context: SigVerifierContext, channels: SigVerifierChannels) -> Self {
+    pub fn new(context: SigVerifierContext, channels: SigVerifierChannels) -> Self {
         let SigVerifierContext {
             migration_status,
             banlist,
@@ -110,12 +250,17 @@ impl SigVerifier {
             num_threads,
             generated_cert_types,
         } = context;
+
         let thread_pool = ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("solSigVerBLS{i:02}"))
             .build()
             .unwrap();
+
+        let cert_thread_metrics = Arc::new(Mutex::new(CertThreadMetrics::default()));
+        let cert_worker = spawn_cert_worker();
         let root_slot = sharable_banks.root().slot();
+
         Self {
             migration_status,
             banlist,
@@ -127,6 +272,8 @@ impl SigVerifier {
             cluster_info,
             leader_schedule,
             thread_pool,
+            cert_worker,
+            cert_thread_metrics,
             generated_cert_types,
         }
     }
@@ -134,10 +281,12 @@ impl SigVerifier {
     fn run(mut self, exit: Arc<AtomicBool>) {
         while !exit.load(Ordering::Relaxed) {
             const SOFT_RECEIVE_CAP: usize = 5000;
+
             let Ok(batches) = recv_batches(&self.channels.packet_receiver, SOFT_RECEIVE_CAP) else {
-                error!("packet_receiver disconnected:  Exiting.");
+                error!("packet_receiver disconnected: Exiting.");
                 break;
             };
+
             if batches.is_empty() || self.migration_status.is_pre_feature_activation() {
                 continue;
             }
@@ -146,12 +295,15 @@ impl SigVerifier {
             self.stats
                 .verify_and_send_batch_us
                 .add_sample(verify_time_us);
-            if let Err(e) = verify_res {
-                error!("verify_and_send_batch() failed with {e}. Exiting.");
+
+            if let Err(err) = verify_res {
+                error!("verify_and_send_batch() failed with {err}. Exiting.");
                 break;
             }
+
             self.stats.maybe_report(self.sharable_banks.root().slot());
         }
+
         self.stats.do_report(self.sharable_banks.root().slot());
     }
 
@@ -165,36 +317,65 @@ impl SigVerifier {
             .extract_filter_msgs_us
             .add_sample(extract_msgs_us);
 
-        let (votes_result, certs_result) = self.thread_pool.join(
-            || {
-                verify_and_send_votes(
-                    votes_to_verify,
-                    &root_bank,
-                    &self.cluster_info,
-                    &self.leader_schedule,
-                    &self.banlist,
-                    &self.thread_pool,
-                    &self.channels,
-                )
-            },
-            || {
-                verify_and_send_certificates(
-                    &mut self.verified_certs,
-                    certs_to_verify,
-                    &root_bank,
-                    &self.channels.channel_to_pool,
-                    &self.banlist,
-                    &self.thread_pool,
-                )
-            },
-        );
+        let (cert_reply_tx, cert_reply_rx) = bounded(1);
 
-        let vote_stats = votes_result?;
-        let cert_stats = certs_result?;
+        self.cert_worker
+            .tx
+            .send(CertWorkerMsg::Job(CertJob {
+                certs_to_verify,
+                root_bank: Arc::clone(&root_bank),
+                banlist: Arc::clone(&self.banlist),
+                channel_to_pool: self.channels.channel_to_pool.clone(),
+                metrics: Arc::clone(&self.cert_thread_metrics),
+                reply: cert_reply_tx,
+            }))
+            .expect("cert worker disconnected");
 
+        let vote_stats = verify_and_send_votes(
+            votes_to_verify,
+            &root_bank,
+            &self.cluster_info,
+            &self.leader_schedule,
+            &self.banlist,
+            &self.thread_pool,
+            &self.channels,
+        )
+        .map_err(SigVerifyError::from)?;
+
+        let cert_wait_start = Instant::now();
+        let cert_result = cert_reply_rx
+            .recv()
+            .expect("cert worker failed to reply")?;
+
+        let cert_wait_us = cert_wait_start.elapsed().as_micros() as u64;
+        {
+            let mut metrics = self.cert_thread_metrics.lock().unwrap();
+            metrics.main_wait_for_cert_us += cert_wait_us;
+        }
+
+        self.verified_certs.extend(cert_result.newly_verified);
         self.stats.vote_stats.merge(vote_stats);
-        self.stats.cert_stats.merge(cert_stats);
+        self.stats.cert_stats.merge(cert_result.stats);
+
         Ok(())
+    }
+
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn verify_and_send_batches_for_tests(&mut self, batches: Vec<PacketBatch>) {
+        self.verify_and_send_batches(batches).unwrap();
+    }
+
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn print_cert_thread_metrics_for_tests(&self) {
+        let metrics = self.cert_thread_metrics.lock().unwrap();
+        eprintln!(
+            "cert-thread metrics: jobs={}, certs_processed={}, idle_us={}, active_us={}, main_wait_for_cert_us={}",
+            metrics.cert_jobs,
+            metrics.certs_processed,
+            metrics.cert_worker_idle_us,
+            metrics.cert_worker_active_us,
+            metrics.main_wait_for_cert_us,
+        );
     }
 
     fn maybe_prune_caches(&mut self, root_slot: Slot) {
@@ -213,21 +394,26 @@ impl SigVerifier {
         let mut certs = Vec::new();
         let mut votes = Vec::new();
         let mut num_pkts = 0u64;
+
         for packet in batches.iter().flatten() {
             num_pkts = num_pkts.saturating_add(1);
+
             if packet.meta().discard() {
                 self.stats.num_discarded_pkts += 1;
                 continue;
             }
+
             let Ok(msg) = packet.deserialize_slice::<ConsensusMessage, _>(..) else {
                 self.stats.num_malformed_pkts += 1;
                 continue;
             };
+
             let Some(remote_pubkey) = packet.meta().remote_pubkey() else {
                 debug_assert!(false, "BLS packet missing remote pubkey");
                 self.stats.num_malformed_pkts += 1;
                 continue;
             };
+
             match msg {
                 ConsensusMessage::Vote(vote) => {
                     if let Some((pubkey, bls_pubkey)) = self.keep_vote(&vote, root_bank) {
@@ -245,14 +431,17 @@ impl SigVerifier {
                         self.stats.num_old_certs_received += 1;
                         continue;
                     }
+
                     if self.verified_certs.contains(&cert.cert_type) {
                         self.stats.num_verified_certs_received += 1;
                         continue;
                     }
+
                     if self.generated_cert_types.has_cert(&cert.cert_type) {
                         self.stats.num_generated_certs_received += 1;
                         continue;
                     }
+
                     certs.push(CertPayload {
                         cert,
                         remote_pubkey,
@@ -260,6 +449,7 @@ impl SigVerifier {
                 }
             }
         }
+
         self.stats.num_pkts.add_sample(num_pkts);
         (certs, votes)
     }
@@ -271,26 +461,42 @@ impl SigVerifier {
         root_bank: &Bank,
     ) -> Option<(Pubkey, BlsPubkeyAffine)> {
         let root_slot = root_bank.slot();
+
         let Some(rank_map) = root_bank.get_rank_map(vote.vote.slot()) else {
             self.stats.discard_vote_no_epoch_stakes += 1;
             return None;
         };
+
         let entry = rank_map
             .get_pubkey_stake_entry(vote.rank.into())
             .or_else(|| {
                 self.stats.discard_vote_invalid_rank += 1;
                 None
             })?;
+
         let ret = Some((entry.vote_account_pubkey, entry.bls_pubkey));
+
         if vote.vote.slot() > root_slot {
             return ret;
         }
-        if consensus_rewards::wants_vote(&self.cluster_info, &self.leader_schedule, root_slot, vote)
-        {
+
+        if consensus_rewards::wants_vote(
+            &self.cluster_info,
+            &self.leader_schedule,
+            root_slot,
+            vote,
+        ) {
             return ret;
         }
+
         self.stats.num_old_votes_received += 1;
         None
+    }
+}
+
+impl Drop for SigVerifier {
+    fn drop(&mut self) {
+        self.cert_worker.shutdown();
     }
 }
 
@@ -302,32 +508,30 @@ fn recv_batches(
     soft_receive_cap: usize,
 ) -> Result<Vec<PacketBatch>, ()> {
     let batch = match receiver.recv_timeout(Duration::from_secs(1)) {
-        Ok(b) => b,
-        Err(e) => match e {
-            RecvTimeoutError::Timeout => {
-                return Ok(vec![]);
-            }
-            RecvTimeoutError::Disconnected => {
-                return Err(());
-            }
+        Ok(batch) => batch,
+        Err(err) => match err {
+            RecvTimeoutError::Timeout => return Ok(vec![]),
+            RecvTimeoutError::Disconnected => return Err(()),
         },
     };
+
     let mut batches = Vec::with_capacity(soft_receive_cap);
     batches.push(batch);
+
     while batches.len() < soft_receive_cap {
         match receiver.try_recv() {
-            Ok(b) => {
-                batches.push(b);
+            Ok(batch) => {
+                batches.push(batch);
             }
-            Err(e) => match e {
+            Err(err) => match err {
                 TryRecvError::Empty => return Ok(batches),
                 TryRecvError::Disconnected => return Err(()),
             },
         }
     }
+
     Ok(batches)
 }
-
 #[cfg(test)]
 mod tests {
     use {
