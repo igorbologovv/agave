@@ -180,7 +180,9 @@ agave-reserved-account-keys = { path = "../reserved-account-keys", features = ["
 agave-scheduler-bindings = { path = "../scheduler-bindings", features = ["agave-unstable-api"] }
 bencher = { workspace = true }
 bitvec = { workspace = true }
+csv = { workspace = true }
 criterion = { workspace = true }
+clap4 = { package = "clap", version = "4", features = ["derive"] }
 serial_test = { workspace = true }
 solana-account = { workspace = true, features = ["dev-context-only-utils"] }
 solana-bpf-loader-program = { path = "../programs/bpf_loader", default-features = false, features = ["agave-unstable-api"] }
