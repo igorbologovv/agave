@@ -278,35 +278,68 @@ impl SigVerifier {
         }
     }
 
-    pub fn run(mut self, exit: Arc<AtomicBool>) {
-        while !exit.load(Ordering::Relaxed) {
-            const SOFT_RECEIVE_CAP: usize = 5000;
+    // pub fn run(mut self, exit: Arc<AtomicBool>) {
+    //     while !exit.load(Ordering::Relaxed) {
+    //         const SOFT_RECEIVE_CAP: usize = 5000;
 
-            let Ok(batches) = recv_batches(&self.channels.packet_receiver, SOFT_RECEIVE_CAP) else {
-                error!("packet_receiver disconnected: Exiting.");
-                break;
-            };
+    //         let Ok(batches) = recv_batches(&self.channels.packet_receiver, SOFT_RECEIVE_CAP) else {
+    //             error!("packet_receiver disconnected: Exiting.");
+    //             break;
+    //         };
 
-            if batches.is_empty() || self.migration_status.is_pre_feature_activation() {
-                continue;
-            }
+    //         if batches.is_empty() || self.migration_status.is_pre_feature_activation() {
+    //             continue;
+    //         }
 
-            let (verify_res, verify_time_us) = measure_us!(self.verify_and_send_batches(batches));
-            self.stats
-                .verify_and_send_batch_us
-                .add_sample(verify_time_us);
+    //         let (verify_res, verify_time_us) = measure_us!(self.verify_and_send_batches(batches));
+    //         self.stats
+    //             .verify_and_send_batch_us
+    //             .add_sample(verify_time_us);
 
-            if let Err(err) = verify_res {
-                error!("verify_and_send_batch() failed with {err}. Exiting.");
-                break;
-            }
+    //         if let Err(err) = verify_res {
+    //             error!("verify_and_send_batch() failed with {err}. Exiting.");
+    //             break;
+    //         }
 
-            self.stats.maybe_report(self.sharable_banks.root().slot());
+    //         self.stats.maybe_report(self.sharable_banks.root().slot());
+    //     }
+
+    //     self.stats.do_report(self.sharable_banks.root().slot());
+    // }
+pub fn run(mut self, exit: Arc<AtomicBool>) {
+    while !exit.load(Ordering::Relaxed) {
+        const SOFT_RECEIVE_CAP: usize = 5000;
+
+        let Ok(batches) = recv_batches(&self.channels.packet_receiver, SOFT_RECEIVE_CAP) else {
+            error!("packet_receiver disconnected: Exiting.");
+            break;
+        };
+
+        #[cfg(feature = "dev-context-only-utils")]
+        let should_skip_for_migration = false;
+
+        #[cfg(not(feature = "dev-context-only-utils"))]
+        let should_skip_for_migration = self.migration_status.is_pre_feature_activation();
+
+        if batches.is_empty() || should_skip_for_migration {
+            continue;
         }
 
-        self.stats.do_report(self.sharable_banks.root().slot());
+        let (verify_res, verify_time_us) = measure_us!(self.verify_and_send_batches(batches));
+        self.stats
+            .verify_and_send_batch_us
+            .add_sample(verify_time_us);
+
+        if let Err(err) = verify_res {
+            error!("verify_and_send_batch() failed with {err}. Exiting.");
+            break;
+        }
+
+        self.stats.maybe_report(self.sharable_banks.root().slot());
     }
 
+    self.stats.do_report(self.sharable_banks.root().slot());
+}
     fn verify_and_send_batches(&mut self, batches: Vec<PacketBatch>) -> Result<(), SigVerifyError> {
         let root_bank = self.sharable_banks.root();
         self.maybe_prune_caches(root_bank.slot());
