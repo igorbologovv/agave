@@ -278,7 +278,7 @@ impl SigVerifier {
         }
     }
 
-    fn run(mut self, exit: Arc<AtomicBool>) {
+    pub fn run(mut self, exit: Arc<AtomicBool>) {
         while !exit.load(Ordering::Relaxed) {
             const SOFT_RECEIVE_CAP: usize = 5000;
 

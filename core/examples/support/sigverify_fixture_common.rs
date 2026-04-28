@@ -14,9 +14,9 @@ use {
         reward_certificate::AddVoteMessage,
         vote::Vote,
     },
-    clap::Parser,
-    crossbeam_channel::{Receiver, bounded},
-    rand::{Rng, RngCore, SeedableRng, rngs::StdRng},
+    clap::{Parser, ValueEnum},
+    crossbeam_channel::{bounded, Receiver, Sender},
+    rand::{rngs::StdRng, Rng, RngCore, SeedableRng},
     rayon::prelude::*,
     solana_bls_signatures::Signature as BLSSignature,
     solana_core::{
@@ -34,7 +34,7 @@ use {
         bank::Bank,
         bank_forks::BankForks,
         genesis_utils::{
-            ValidatorVoteKeypairs, create_genesis_config_with_alpenglow_vote_accounts,
+            create_genesis_config_with_alpenglow_vote_accounts, ValidatorVoteKeypairs,
         },
     },
     solana_streamer::nonblocking::simple_qos::SimpleQosBanlist,
@@ -87,6 +87,18 @@ pub struct FixtureBuildConfig {
     pub output: String,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, serde::Serialize)]
+pub enum ReplayArrivalPattern {
+    /// Use arrival_us from the fixture file as-is.
+    Stored,
+
+    /// Reassign votes and certs uniformly across each slot window.
+    Uniform,
+
+    /// Reassign votes uniformly, but place certs into random bursts.
+    CertBursts,
+}
+
 #[derive(Debug, Clone, Parser)]
 pub struct ReplayConfig {
     #[arg(long, help = "Emit CSV output instead of human-readable output")]
@@ -99,16 +111,45 @@ pub struct ReplayConfig {
     pub input: String,
 
     #[arg(
-        long = "poll-interval-us",
-        default_value_t = 100,
-        help = "Synthetic streamer poll interval in microseconds"
+        long = "arrival-pattern",
+        value_enum,
+        default_value = "cert-bursts",
+        help = "Replay arrival layout: stored, uniform, or cert-bursts"
     )]
-    pub poll_interval_us: u64,
+    pub arrival_pattern: ReplayArrivalPattern,
+
+    #[arg(
+        long = "arrival-seed",
+        default_value_t = 0,
+        help = "Seed for replay-only arrival reshuffling; 0 derives it from workload.seed"
+    )]
+    pub arrival_seed: u64,
+
+    #[arg(
+        long = "cert-bursts-per-slot",
+        default_value_t = 20,
+        help = "Number of cert arrival bursts generated per slot for cert-bursts layout"
+    )]
+    pub cert_bursts_per_slot: usize,
+
+    #[arg(
+        long = "cert-burst-jitter-us",
+        default_value_t = 500,
+        help = "Maximum +/- jitter around each cert burst center in microseconds"
+    )]
+    pub cert_burst_jitter_us: u64,
+
+    #[arg(
+        long = "batch-window-us",
+        default_value_t = 1600,
+        help = "Time window in microseconds used to collect arrived packets into one PacketBatch"
+    )]
+    pub batch_window_us: u64,
 
     #[arg(
         long = "max-packets-per-batch",
         default_value_t = 1024,
-        help = "Maximum number of packets emitted in one synthetic streamer batch"
+        help = "Maximum number of packets emitted in one synthetic PacketBatch"
     )]
     pub max_packets_per_batch: usize,
 
@@ -117,6 +158,13 @@ pub struct ReplayConfig {
         help = "Thread count for the verifier thread pool"
     )]
     pub num_threads: usize,
+
+    #[arg(
+        long = "debug-batches",
+        default_value_t = 0,
+        help = "Print the first N timed batches before and during replay"
+    )]
+    pub debug_batches: usize,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -150,10 +198,32 @@ pub struct StoredWorkload {
     pub packets: Vec<StoredPacket>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredPacketV1 {
+    pub message_bytes: Vec<u8>,
+    pub remote_pubkey: Pubkey,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredWorkloadV1 {
+    pub seed: u64,
+    pub num_slots: usize,
+    pub votes_per_slot: usize,
+    pub certs_per_slot: usize,
+    pub base_slot: u64,
+    pub cert_signers: usize,
+    pub num_validators: usize,
+    pub total_packets: usize,
+    pub vote_packets: usize,
+    pub cert_packets: usize,
+    pub packets: Vec<StoredPacketV1>,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct OutputRow {
     pub seed: u64,
-    pub poll_interval_us: u64,
+    pub arrival_pattern: ReplayArrivalPattern,
+    pub batch_window_us: u64,
     pub max_packets_per_batch: usize,
     pub emitted_batches: usize,
     pub avg_packets_per_batch: f64,
@@ -174,8 +244,25 @@ pub struct OutputRow {
     pub per_packet_us: u64,
 }
 
+pub struct TimedBatch {
+    pub send_at_us: u64,
+    pub batch: PacketBatch,
+}
+
+#[derive(Debug)]
+pub struct TimedBatchDebug {
+    pub index: usize,
+    pub send_at_us: u64,
+    pub packet_count: usize,
+    pub vote_count: usize,
+    pub cert_count: usize,
+    pub first_arrival_us: u64,
+    pub last_arrival_us: u64,
+}
+
 pub struct ExampleContext {
     pub verifier: SigVerifier,
+    pub packet_sender: Sender<PacketBatch>,
     pub validator_keypairs: Vec<ValidatorVoteKeypairs>,
     pub validator_ranks: Vec<u16>,
     pub _repair_receiver: VerifiedVoterSlotsReceiver,
@@ -204,14 +291,19 @@ pub fn validate_fixture_build_config(config: &FixtureBuildConfig) -> Result<(), 
 }
 
 pub fn validate_replay_config(config: &ReplayConfig) -> Result<(), String> {
-    if config.poll_interval_us == 0 {
-        return Err("poll_interval_us must be > 0".to_string());
+    if config.batch_window_us == 0 {
+        return Err("batch_window_us must be > 0".to_string());
     }
     if config.max_packets_per_batch == 0 {
         return Err("max_packets_per_batch must be > 0".to_string());
     }
     if config.num_threads == 0 {
         return Err("num_threads must be > 0".to_string());
+    }
+    if matches!(config.arrival_pattern, ReplayArrivalPattern::CertBursts)
+        && config.cert_bursts_per_slot == 0
+    {
+        return Err("cert_bursts_per_slot must be > 0 for cert-bursts".to_string());
     }
     Ok(())
 }
@@ -323,7 +415,7 @@ pub fn init_example_context(
     let (reward_sender, reward_receiver) = bounded(CHANNEL_SIZE);
     let (pool_sender, pool_receiver) = bounded(CHANNEL_SIZE);
     let (metrics_sender, metrics_receiver) = bounded(CHANNEL_SIZE);
-    let (_packet_sender, packet_receiver) = bounded(CHANNEL_SIZE);
+    let (packet_sender, packet_receiver) = bounded(CHANNEL_SIZE);
 
     let banlist = {
         let (banlist, _) = SimpleQosBanlist::new();
@@ -353,6 +445,7 @@ pub fn init_example_context(
 
     ExampleContext {
         verifier,
+        packet_sender,
         validator_keypairs,
         validator_ranks,
         _repair_receiver: repair_receiver,
@@ -371,6 +464,7 @@ pub fn create_signed_vote_message(
     let bls_keypair = &validator_keypairs[validator_index].bls_keypair;
     let payload = wincode::serialize(&vote).expect("failed to serialize vote");
     let signature: BLSSignature = bls_keypair.sign(&payload).into();
+
     VoteMessage {
         vote,
         signature,
@@ -458,6 +552,7 @@ pub fn consensus_message_to_stored_packet(
     arrival_us: u64,
 ) -> StoredPacket {
     let message_bytes = bincode::serialize(message).expect("failed to serialize message");
+
     StoredPacket {
         message_bytes,
         remote_pubkey,
@@ -494,7 +589,7 @@ pub fn build_stored_workload(ctx: &ExampleContext, config: &FixtureBuildConfig) 
                 config.seed ^ (slot_index as u64).wrapping_mul(0xA076_1D64_78BD_642F),
             );
 
-            let slot_base_arrival_us = slot_index as u64 * SLOT_WINDOW_US;
+            let slot_start_us = slot_index as u64 * SLOT_WINDOW_US;
 
             let mut slot_packets =
                 Vec::with_capacity(config.votes_per_slot + config.certs_per_slot);
@@ -507,8 +602,7 @@ pub fn build_stored_workload(ctx: &ExampleContext, config: &FixtureBuildConfig) 
                 let (message, remote_pubkey) =
                     build_vote_message_and_remote(ctx, slot, block_id, global_vote_index);
 
-                let arrival_us =
-                    slot_base_arrival_us + slot_rng.gen_range(0..SLOT_WINDOW_US);
+                let arrival_us = slot_start_us + slot_rng.gen_range(0..SLOT_WINDOW_US);
 
                 slot_packets.push(consensus_message_to_stored_packet(
                     &message,
@@ -522,8 +616,7 @@ pub fn build_stored_workload(ctx: &ExampleContext, config: &FixtureBuildConfig) 
             for _ in 0..config.certs_per_slot {
                 let (message, remote_pubkey) = build_cert_message_and_remote(ctx, slot, block_id);
 
-                let arrival_us =
-                    slot_base_arrival_us + slot_rng.gen_range(0..SLOT_WINDOW_US);
+                let arrival_us = slot_start_us + slot_rng.gen_range(0..SLOT_WINDOW_US);
 
                 slot_packets.push(consensus_message_to_stored_packet(
                     &message,
@@ -557,44 +650,271 @@ pub fn build_stored_workload(ctx: &ExampleContext, config: &FixtureBuildConfig) 
     }
 }
 
-pub fn stored_workload_to_streamer_batches(
+fn convert_legacy_workload(legacy: StoredWorkloadV1) -> StoredWorkload {
+    let per_slot_packets = legacy
+        .votes_per_slot
+        .saturating_add(legacy.certs_per_slot);
+
+    let packets = legacy
+        .packets
+        .into_iter()
+        .enumerate()
+        .map(|(packet_index, packet)| {
+            let slot_index = if per_slot_packets == 0 {
+                0
+            } else {
+                packet_index / per_slot_packets
+            };
+
+            let index_in_slot = if per_slot_packets == 0 {
+                0
+            } else {
+                packet_index % per_slot_packets
+            };
+
+            let kind = if index_in_slot < legacy.votes_per_slot {
+                StoredPacketKind::Vote
+            } else {
+                StoredPacketKind::Cert
+            };
+
+            StoredPacket {
+                message_bytes: packet.message_bytes,
+                remote_pubkey: packet.remote_pubkey,
+                kind,
+                slot_index,
+                arrival_us: slot_index as u64 * SLOT_WINDOW_US,
+            }
+        })
+        .collect();
+
+    StoredWorkload {
+        seed: legacy.seed,
+        num_slots: legacy.num_slots,
+        votes_per_slot: legacy.votes_per_slot,
+        certs_per_slot: legacy.certs_per_slot,
+        base_slot: legacy.base_slot,
+        slot_window_us: SLOT_WINDOW_US,
+        cert_signers: legacy.cert_signers,
+        num_validators: legacy.num_validators,
+        total_packets: legacy.total_packets,
+        vote_packets: legacy.vote_packets,
+        cert_packets: legacy.cert_packets,
+        packets,
+    }
+}
+
+fn replay_arrival_seed(workload: &StoredWorkload, config: &ReplayConfig) -> u64 {
+    if config.arrival_seed == 0 {
+        workload.seed ^ 0xCE17_BAAD_D157_1B11
+    } else {
+        config.arrival_seed
+    }
+}
+
+fn slot_rng_seed(seed: u64, slot_index: usize) -> u64 {
+    seed ^ (slot_index as u64).wrapping_mul(0xA076_1D64_78BD_642F)
+}
+
+fn uniform_arrival_us(rng: &mut StdRng, slot_start_us: u64, slot_window_us: u64) -> u64 {
+    slot_start_us + rng.gen_range(0..slot_window_us)
+}
+
+fn burst_arrival_us(
+    rng: &mut StdRng,
+    slot_start_us: u64,
+    slot_window_us: u64,
+    burst_centers: &[u64],
+    burst_jitter_us: u64,
+) -> u64 {
+    let center = burst_centers[rng.gen_range(0..burst_centers.len())];
+
+    let jitter_span = burst_jitter_us.saturating_mul(2).saturating_add(1);
+    let jitter = rng.gen_range(0..jitter_span) as i64 - burst_jitter_us as i64;
+
+    let arrival_offset = (center as i64 + jitter)
+        .clamp(0, slot_window_us.saturating_sub(1) as i64) as u64;
+
+    slot_start_us + arrival_offset
+}
+
+pub fn reshuffle_workload_for_replay(
     workload: &StoredWorkload,
-    poll_interval_us: u64,
+    config: &ReplayConfig,
+) -> StoredWorkload {
+    if matches!(config.arrival_pattern, ReplayArrivalPattern::Stored) {
+        return workload.clone();
+    }
+
+    let seed = replay_arrival_seed(workload, config);
+    let mut packets = workload.packets.clone();
+
+    let mut slot_rngs: Vec<StdRng> = (0..workload.num_slots)
+        .map(|slot_index| StdRng::seed_from_u64(slot_rng_seed(seed, slot_index)))
+        .collect();
+
+    let cert_burst_centers_by_slot: Vec<Vec<u64>> = (0..workload.num_slots)
+        .map(|slot_index| {
+            let mut rng = StdRng::seed_from_u64(slot_rng_seed(seed ^ 0xC347_B015, slot_index));
+
+            (0..config.cert_bursts_per_slot)
+                .map(|_| rng.gen_range(0..workload.slot_window_us))
+                .collect()
+        })
+        .collect();
+
+    for packet in packets.iter_mut() {
+        let slot_index = packet.slot_index;
+        let slot_start_us = slot_index as u64 * workload.slot_window_us;
+        let rng = &mut slot_rngs[slot_index];
+
+        packet.arrival_us = match config.arrival_pattern {
+            ReplayArrivalPattern::Stored => packet.arrival_us,
+            ReplayArrivalPattern::Uniform => {
+                uniform_arrival_us(rng, slot_start_us, workload.slot_window_us)
+            }
+            ReplayArrivalPattern::CertBursts => match packet.kind {
+                StoredPacketKind::Vote => {
+                    uniform_arrival_us(rng, slot_start_us, workload.slot_window_us)
+                }
+                StoredPacketKind::Cert => burst_arrival_us(
+                    rng,
+                    slot_start_us,
+                    workload.slot_window_us,
+                    &cert_burst_centers_by_slot[slot_index],
+                    config.cert_burst_jitter_us,
+                ),
+            },
+        };
+    }
+
+    packets.sort_by_key(|packet| packet.arrival_us);
+
+    StoredWorkload {
+        seed: workload.seed,
+        num_slots: workload.num_slots,
+        votes_per_slot: workload.votes_per_slot,
+        certs_per_slot: workload.certs_per_slot,
+        base_slot: workload.base_slot,
+        slot_window_us: workload.slot_window_us,
+        cert_signers: workload.cert_signers,
+        num_validators: workload.num_validators,
+        total_packets: workload.total_packets,
+        vote_packets: workload.vote_packets,
+        cert_packets: workload.cert_packets,
+        packets,
+    }
+}
+
+pub fn make_timed_batches(
+    workload: &StoredWorkload,
+    batch_window_us: u64,
     max_packets_per_batch: usize,
-) -> Vec<PacketBatch> {
-    assert!(poll_interval_us > 0);
+) -> Vec<TimedBatch> {
+    assert!(batch_window_us > 0);
     assert!(max_packets_per_batch > 0);
 
     if workload.packets.is_empty() {
         return Vec::new();
     }
 
-    let mut batches = Vec::new();
-    let mut index = 0;
+    let mut timed_batches = Vec::new();
+    let mut packet_index = 0;
 
-    while index < workload.packets.len() {
-        let first_arrival_us = workload.packets[index].arrival_us;
-        let poll_start_us = first_arrival_us - (first_arrival_us % poll_interval_us);
-        let poll_end_us = poll_start_us.saturating_add(poll_interval_us);
+    while packet_index < workload.packets.len() {
+        let first_packet_arrival_us = workload.packets[packet_index].arrival_us;
+        let window_start_us =
+            first_packet_arrival_us - (first_packet_arrival_us % batch_window_us);
+        let window_end_us = window_start_us.saturating_add(batch_window_us);
 
-        while index < workload.packets.len() && workload.packets[index].arrival_us < poll_end_us {
+        while packet_index < workload.packets.len()
+            && workload.packets[packet_index].arrival_us < window_end_us
+        {
             let mut packets = Vec::with_capacity(max_packets_per_batch);
 
-            while index < workload.packets.len()
-                && workload.packets[index].arrival_us < poll_end_us
+            while packet_index < workload.packets.len()
+                && workload.packets[packet_index].arrival_us < window_end_us
                 && packets.len() < max_packets_per_batch
             {
-                packets.push(stored_packet_to_packet(workload.packets[index].clone()));
-                index += 1;
+                packets.push(stored_packet_to_packet(
+                    workload.packets[packet_index].clone(),
+                ));
+                packet_index += 1;
             }
 
             if !packets.is_empty() {
-                batches.push(RecycledPacketBatch::new(packets).into());
+                timed_batches.push(TimedBatch {
+                    send_at_us: window_end_us,
+                    batch: RecycledPacketBatch::new(packets).into(),
+                });
             }
         }
     }
 
-    batches
+    timed_batches
+}
+
+pub fn debug_timed_batches(
+    workload: &StoredWorkload,
+    batch_window_us: u64,
+    max_packets_per_batch: usize,
+    max_batches: usize,
+) -> Vec<TimedBatchDebug> {
+    if max_batches == 0 || workload.packets.is_empty() {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+    let mut packet_index = 0;
+    let mut batch_index = 0;
+
+    while packet_index < workload.packets.len() && result.len() < max_batches {
+        let first_packet_arrival_us = workload.packets[packet_index].arrival_us;
+        let window_start_us =
+            first_packet_arrival_us - (first_packet_arrival_us % batch_window_us);
+        let window_end_us = window_start_us.saturating_add(batch_window_us);
+
+        while packet_index < workload.packets.len()
+            && workload.packets[packet_index].arrival_us < window_end_us
+            && result.len() < max_batches
+        {
+            let first_arrival_us = workload.packets[packet_index].arrival_us;
+            let mut last_arrival_us = first_arrival_us;
+            let mut packet_count = 0usize;
+            let mut vote_count = 0usize;
+            let mut cert_count = 0usize;
+
+            while packet_index < workload.packets.len()
+                && workload.packets[packet_index].arrival_us < window_end_us
+                && packet_count < max_packets_per_batch
+            {
+                match workload.packets[packet_index].kind {
+                    StoredPacketKind::Vote => vote_count += 1,
+                    StoredPacketKind::Cert => cert_count += 1,
+                }
+
+                packet_count += 1;
+                last_arrival_us = workload.packets[packet_index].arrival_us;
+                packet_index += 1;
+            }
+
+            if packet_count > 0 {
+                result.push(TimedBatchDebug {
+                    index: batch_index,
+                    send_at_us: window_end_us,
+                    packet_count,
+                    vote_count,
+                    cert_count,
+                    first_arrival_us,
+                    last_arrival_us,
+                });
+
+                batch_index += 1;
+            }
+        }
+    }
+
+    result
 }
 
 pub fn save_workload_to_file<P: AsRef<Path>>(
@@ -606,12 +926,36 @@ pub fn save_workload_to_file<P: AsRef<Path>>(
     Ok(())
 }
 
-pub fn load_workload_from_file<P: AsRef<Path>>(
+fn load_current_workload_from_file<P: AsRef<Path>>(
     path: P,
 ) -> Result<StoredWorkload, Box<dyn std::error::Error>> {
     let reader = BufReader::new(File::open(path)?);
     let workload = bincode::deserialize_from(reader)?;
     Ok(workload)
+}
+
+fn load_legacy_workload_from_file<P: AsRef<Path>>(
+    path: P,
+) -> Result<StoredWorkload, Box<dyn std::error::Error>> {
+    let reader = BufReader::new(File::open(path)?);
+    let legacy: StoredWorkloadV1 = bincode::deserialize_from(reader)?;
+    Ok(convert_legacy_workload(legacy))
+}
+
+pub fn load_workload_from_file<P: AsRef<Path>>(
+    path: P,
+) -> Result<StoredWorkload, Box<dyn std::error::Error>> {
+    match load_current_workload_from_file(path.as_ref()) {
+        Ok(workload) => Ok(workload),
+        Err(current_err) => {
+            eprintln!(
+                "warning: failed to load fixture as current format: {current_err}; \
+                 trying legacy format"
+            );
+
+            load_legacy_workload_from_file(path)
+        }
+    }
 }
 
 pub fn print_results(row: &OutputRow, csv_output: bool) {
