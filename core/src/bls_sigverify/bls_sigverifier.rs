@@ -49,7 +49,7 @@ pub(super) const NUM_SLOTS_FOR_VERIFY: Slot = 90_000;
 /// We ban the sender for 2 days which roughly corresponds to an epoch
 pub(super) const BAN_TIMEOUT: Duration = Duration::from_hours(48);
 
-pub(crate) struct SigVerifierContext {
+pub struct SigVerifierContext {
     pub(crate) migration_status: Arc<MigrationStatus>,
     pub(crate) banlist: Arc<SimpleQosBanlist>,
     pub(crate) sharable_banks: SharableBanks,
@@ -58,15 +58,51 @@ pub(crate) struct SigVerifierContext {
     pub(crate) num_threads: usize,
     pub(crate) generated_cert_types: Arc<GeneratedCertTypes>,
 }
-
-pub(crate) struct SigVerifierChannels {
+impl SigVerifierContext {
+    pub fn new(
+        migration_status: Arc<MigrationStatus>,
+        banlist: Arc<SimpleQosBanlist>,
+        sharable_banks: SharableBanks,
+        cluster_info: Arc<ClusterInfo>,
+        leader_schedule: Arc<LeaderScheduleCache>,
+        num_threads: usize,
+        generated_cert_types: Arc<GeneratedCertTypes>,
+    ) -> Self {
+        Self {
+            migration_status,
+            banlist,
+            sharable_banks,
+            cluster_info,
+            leader_schedule,
+            num_threads,
+            generated_cert_types,
+        }
+    }
+}
+pub struct SigVerifierChannels {
     pub(crate) packet_receiver: Receiver<PacketBatch>,
     pub(crate) channel_to_repair: VerifiedVoterSlotsSender,
     pub(crate) channel_to_reward: Sender<AddVoteMessage>,
     pub(crate) channel_to_pool: Sender<Vec<ConsensusMessage>>,
     pub(crate) channel_to_metrics: ConsensusMetricsEventSender,
 }
-
+impl SigVerifierChannels {
+    pub fn new(
+        packet_receiver: Receiver<PacketBatch>,
+        channel_to_repair: VerifiedVoterSlotsSender,
+        channel_to_reward: Sender<AddVoteMessage>,
+        channel_to_pool: Sender<Vec<ConsensusMessage>>,
+        channel_to_metrics: ConsensusMetricsEventSender,
+    ) -> Self {
+        Self {
+            packet_receiver,
+            channel_to_repair,
+            channel_to_reward,
+            channel_to_pool,
+            channel_to_metrics,
+        }
+    }
+}
 /// Starts the BLS sigverifier service in its own dedicated thread.
 pub(crate) fn spawn_service(
     exit: Arc<AtomicBool>,
@@ -81,7 +117,7 @@ pub(crate) fn spawn_service(
         .unwrap()
 }
 
-struct SigVerifier {
+pub struct SigVerifier {
     migration_status: Arc<MigrationStatus>,
     banlist: Arc<SimpleQosBanlist>,
     channels: SigVerifierChannels,
@@ -100,7 +136,7 @@ struct SigVerifier {
 }
 
 impl SigVerifier {
-    fn new(context: SigVerifierContext, channels: SigVerifierChannels) -> Self {
+    pub fn new(context: SigVerifierContext, channels: SigVerifierChannels) -> Self {
         let SigVerifierContext {
             migration_status,
             banlist,
@@ -131,14 +167,17 @@ impl SigVerifier {
         }
     }
 
-    fn run(mut self, exit: Arc<AtomicBool>) {
+    pub fn run(mut self, exit: Arc<AtomicBool>) {
         while !exit.load(Ordering::Relaxed) {
             const SOFT_RECEIVE_CAP: usize = 5000;
             let Ok(batches) = recv_batches(&self.channels.packet_receiver, SOFT_RECEIVE_CAP) else {
                 error!("packet_receiver disconnected:  Exiting.");
                 break;
             };
-            if batches.is_empty() || self.migration_status.is_pre_feature_activation() {
+            if batches.is_empty()
+                || (!cfg!(feature = "dev-context-only-utils")
+                    && self.migration_status.is_pre_feature_activation())
+            {
                 continue;
             }
 
@@ -155,7 +194,7 @@ impl SigVerifier {
         self.stats.do_report(self.sharable_banks.root().slot());
     }
 
-    fn verify_and_send_batches(&mut self, batches: Vec<PacketBatch>) -> Result<(), SigVerifyError> {
+    pub fn verify_and_send_batches(&mut self, batches: Vec<PacketBatch>) -> Result<(), SigVerifyError> {
         let root_bank = self.sharable_banks.root();
         self.maybe_prune_caches(root_bank.slot());
 
@@ -241,7 +280,9 @@ impl SigVerifier {
                     }
                 }
                 ConsensusMessage::Certificate(cert) => {
-                    if cert.cert_type.slot() <= root_slot {
+                    if !cfg!(feature = "dev-context-only-utils")
+                        && cert.cert_type.slot() <= root_slot
+                    {
                         self.stats.num_old_certs_received += 1;
                         continue;
                     }
@@ -282,7 +323,8 @@ impl SigVerifier {
                 None
             })?;
         let ret = Some((entry.vote_account_pubkey, entry.bls_pubkey));
-        if vote.vote.slot() > root_slot {
+
+        if cfg!(feature = "dev-context-only-utils") || vote.vote.slot() > root_slot {
             return ret;
         }
         if consensus_rewards::wants_vote(&self.cluster_info, &self.leader_schedule, root_slot, vote)
