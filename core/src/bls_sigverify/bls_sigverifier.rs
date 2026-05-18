@@ -35,7 +35,7 @@ use {
             atomic::{AtomicBool, Ordering},
         },
         thread::{self, Builder},
-        time::Duration,
+        time::{Duration, Instant},
     },
 };
 
@@ -49,6 +49,102 @@ pub(super) const NUM_SLOTS_FOR_VERIFY: Slot = 90_000;
 /// We ban the sender for 2 days which roughly corresponds to an epoch
 pub(super) const BAN_TIMEOUT: Duration = Duration::from_hours(48);
 
+#[derive(Debug)]
+pub struct PerSlotTiming {
+    base_slot: Slot,
+    per_slot_us: Vec<u64>,
+    scratch_counts: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PerSlotTimingSummary {
+    pub total_us: u64,
+    pub avg_us_per_slot: f64,
+    pub max_us_per_slot: u64,
+    pub max_slot: Slot,
+}
+
+impl PerSlotTiming {
+    pub fn new(base_slot: Slot, num_slots: usize) -> Self {
+        Self {
+            base_slot,
+            per_slot_us: vec![0; num_slots],
+            scratch_counts: vec![0; num_slots],
+        }
+    }
+
+    fn clear_current(&mut self) {
+        self.scratch_counts.fill(0);
+    }
+
+    fn count_slot(&mut self, slot: Slot) {
+        let Some(offset) = slot.checked_sub(self.base_slot) else {
+            return;
+        };
+
+        let index = offset as usize;
+
+        if let Some(count) = self.scratch_counts.get_mut(index) {
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn add_elapsed_for_current(&mut self, elapsed_us: u64) {
+        let total_messages: u64 = self.scratch_counts.iter().sum();
+
+        if total_messages == 0 || elapsed_us == 0 {
+            return;
+        }
+
+        let mut assigned_us = 0u64;
+        let mut first_nonzero_index = None;
+
+        for (index, count) in self.scratch_counts.iter().copied().enumerate() {
+            if count == 0 {
+                continue;
+            }
+
+            if first_nonzero_index.is_none() {
+                first_nonzero_index = Some(index);
+            }
+
+            let slot_us =
+                ((elapsed_us as u128 * count as u128) / total_messages as u128) as u64;
+
+            self.per_slot_us[index] = self.per_slot_us[index].saturating_add(slot_us);
+            assigned_us = assigned_us.saturating_add(slot_us);
+        }
+
+        if let Some(index) = first_nonzero_index {
+            let remainder_us = elapsed_us.saturating_sub(assigned_us);
+            self.per_slot_us[index] = self.per_slot_us[index].saturating_add(remainder_us);
+        }
+    }
+
+    pub fn summary(&self) -> PerSlotTimingSummary {
+        if self.per_slot_us.is_empty() {
+            return PerSlotTimingSummary::default();
+        }
+
+        let total_us: u64 = self.per_slot_us.iter().sum();
+
+        let (max_index, max_us_per_slot) = self
+            .per_slot_us
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by_key(|(_, value)| *value)
+            .unwrap_or((0, 0));
+
+        PerSlotTimingSummary {
+            total_us,
+            avg_us_per_slot: total_us as f64 / self.per_slot_us.len() as f64,
+            max_us_per_slot,
+            max_slot: self.base_slot + max_index as Slot,
+        }
+    }
+}
+
 pub struct SigVerifierContext {
     pub(crate) migration_status: Arc<MigrationStatus>,
     pub(crate) banlist: Arc<SimpleQosBanlist>,
@@ -58,6 +154,7 @@ pub struct SigVerifierContext {
     pub(crate) num_threads: usize,
     pub(crate) generated_cert_types: Arc<GeneratedCertTypes>,
 }
+
 impl SigVerifierContext {
     pub fn new(
         migration_status: Arc<MigrationStatus>,
@@ -79,6 +176,7 @@ impl SigVerifierContext {
         }
     }
 }
+
 pub struct SigVerifierChannels {
     pub(crate) packet_receiver: Receiver<PacketBatch>,
     pub(crate) channel_to_repair: VerifiedVoterSlotsSender,
@@ -86,6 +184,7 @@ pub struct SigVerifierChannels {
     pub(crate) channel_to_pool: Sender<Vec<ConsensusMessage>>,
     pub(crate) channel_to_metrics: ConsensusMetricsEventSender,
 }
+
 impl SigVerifierChannels {
     pub fn new(
         packet_receiver: Receiver<PacketBatch>,
@@ -103,6 +202,7 @@ impl SigVerifierChannels {
         }
     }
 }
+
 /// Starts the BLS sigverifier service in its own dedicated thread.
 pub(crate) fn spawn_service(
     exit: Arc<AtomicBool>,
@@ -146,12 +246,15 @@ impl SigVerifier {
             num_threads,
             generated_cert_types,
         } = context;
+
         let thread_pool = ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("solSigVerBLS{i:02}"))
             .build()
             .unwrap();
+
         let root_slot = sharable_banks.root().slot();
+
         Self {
             migration_status,
             banlist,
@@ -167,13 +270,31 @@ impl SigVerifier {
         }
     }
 
-    pub fn run(mut self, exit: Arc<AtomicBool>) {
+    pub fn run(self, exit: Arc<AtomicBool>) {
+        self.run_impl(exit, None);
+    }
+
+    pub fn run_with_per_slot_timing(
+        self,
+        exit: Arc<AtomicBool>,
+        timing: &mut PerSlotTiming,
+    ) {
+        self.run_impl(exit, Some(timing));
+    }
+
+    fn run_impl(
+        mut self,
+        exit: Arc<AtomicBool>,
+        mut timing: Option<&mut PerSlotTiming>,
+    ) {
         while !exit.load(Ordering::Relaxed) {
             const SOFT_RECEIVE_CAP: usize = 5000;
+
             let Ok(batches) = recv_batches(&self.channels.packet_receiver, SOFT_RECEIVE_CAP) else {
                 error!("packet_receiver disconnected:  Exiting.");
                 break;
             };
+
             if batches.is_empty()
                 || (!cfg!(feature = "dev-context-only-utils")
                     && self.migration_status.is_pre_feature_activation())
@@ -181,25 +302,66 @@ impl SigVerifier {
                 continue;
             }
 
-            let (verify_res, verify_time_us) = measure_us!(self.verify_and_send_batches(batches));
+            let (verify_res, verify_time_us) = measure_us!(match timing.as_deref_mut() {
+                Some(timing) => self.verify_and_send_batches_with_timing(batches, timing),
+                None => self.verify_and_send_batches(batches),
+            });
+
             self.stats
                 .verify_and_send_batch_us
                 .add_sample(verify_time_us);
+
             if let Err(e) = verify_res {
                 error!("verify_and_send_batch() failed with {e}. Exiting.");
                 break;
             }
+
             self.stats.maybe_report(self.sharable_banks.root().slot());
         }
+
         self.stats.do_report(self.sharable_banks.root().slot());
     }
 
-    pub fn verify_and_send_batches(&mut self, batches: Vec<PacketBatch>) -> Result<(), SigVerifyError> {
+    pub fn verify_and_send_batches(
+        &mut self,
+        batches: Vec<PacketBatch>,
+    ) -> Result<(), SigVerifyError> {
+        self.verify_and_send_batches_impl(batches, None)
+    }
+
+    pub fn verify_and_send_batches_with_timing(
+        &mut self,
+        batches: Vec<PacketBatch>,
+        timing: &mut PerSlotTiming,
+    ) -> Result<(), SigVerifyError> {
+        self.verify_and_send_batches_impl(batches, Some(timing))
+    }
+
+    fn verify_and_send_batches_impl(
+        &mut self,
+        batches: Vec<PacketBatch>,
+        mut timing: Option<&mut PerSlotTiming>,
+    ) -> Result<(), SigVerifyError> {
+        let module_start = timing.as_ref().map(|_| Instant::now());
+
         let root_bank = self.sharable_banks.root();
         self.maybe_prune_caches(root_bank.slot());
 
         let ((certs_to_verify, votes_to_verify), extract_msgs_us) =
             measure_us!(self.extract_and_filter_msgs(batches, &root_bank));
+
+        if let Some(timing) = timing.as_deref_mut() {
+            timing.clear_current();
+
+            for vote in &votes_to_verify {
+                timing.count_slot(vote.vote_message.vote.slot());
+            }
+
+            for cert in &certs_to_verify {
+                timing.count_slot(cert.cert.cert_type.slot());
+            }
+        }
+
         self.stats
             .extract_filter_msgs_us
             .add_sample(extract_msgs_us);
@@ -233,6 +395,12 @@ impl SigVerifier {
 
         self.stats.vote_stats.merge(vote_stats);
         self.stats.cert_stats.merge(cert_stats);
+
+        if let (Some(timing), Some(module_start)) = (timing, module_start) {
+            let elapsed_us = module_start.elapsed().as_micros() as u64;
+            timing.add_elapsed_for_current(elapsed_us);
+        }
+
         Ok(())
     }
 
@@ -252,21 +420,26 @@ impl SigVerifier {
         let mut certs = Vec::new();
         let mut votes = Vec::new();
         let mut num_pkts = 0u64;
+
         for packet in batches.iter().flatten() {
             num_pkts = num_pkts.saturating_add(1);
+
             if packet.meta().discard() {
                 self.stats.num_discarded_pkts += 1;
                 continue;
             }
+
             let Ok(msg) = packet.deserialize_slice::<ConsensusMessage, _>(..) else {
                 self.stats.num_malformed_pkts += 1;
                 continue;
             };
+
             let Some(remote_pubkey) = packet.meta().remote_pubkey() else {
                 debug_assert!(false, "BLS packet missing remote pubkey");
                 self.stats.num_malformed_pkts += 1;
                 continue;
             };
+
             match msg {
                 ConsensusMessage::Vote(vote) => {
                     if let Some((pubkey, bls_pubkey)) = self.keep_vote(&vote, root_bank) {
@@ -286,14 +459,17 @@ impl SigVerifier {
                         self.stats.num_old_certs_received += 1;
                         continue;
                     }
+
                     if self.verified_certs.contains(&cert.cert_type) {
                         self.stats.num_verified_certs_received += 1;
                         continue;
                     }
+
                     if self.generated_cert_types.has_cert(&cert.cert_type) {
                         self.stats.num_generated_certs_received += 1;
                         continue;
                     }
+
                     certs.push(CertPayload {
                         cert,
                         remote_pubkey,
@@ -301,6 +477,7 @@ impl SigVerifier {
                 }
             }
         }
+
         self.stats.num_pkts.add_sample(num_pkts);
         (certs, votes)
     }
@@ -312,10 +489,12 @@ impl SigVerifier {
         root_bank: &Bank,
     ) -> Option<(Pubkey, PopVerified<BlsPubkeyAffine>)> {
         let root_slot = root_bank.slot();
+
         let Some(rank_map) = root_bank.get_rank_map(vote.vote.slot()) else {
             self.stats.discard_vote_no_epoch_stakes += 1;
             return None;
         };
+
         let entry = rank_map
             .get_pubkey_stake_entry(vote.rank.into())
             .or_else(|| {
@@ -327,10 +506,12 @@ impl SigVerifier {
         if cfg!(feature = "dev-context-only-utils") || vote.vote.slot() > root_slot {
             return ret;
         }
+
         if consensus_rewards::wants_vote(&self.cluster_info, &self.leader_schedule, root_slot, vote)
         {
             return ret;
         }
+
         self.stats.num_old_votes_received += 1;
         None
     }
@@ -354,8 +535,10 @@ fn recv_batches(
             }
         },
     };
+
     let mut batches = Vec::with_capacity(soft_receive_cap);
     batches.push(batch);
+
     while batches.len() < soft_receive_cap {
         match receiver.try_recv() {
             Ok(b) => {
@@ -367,9 +550,9 @@ fn recv_batches(
             },
         }
     }
+
     Ok(batches)
 }
-
 #[cfg(test)]
 mod tests {
     use {

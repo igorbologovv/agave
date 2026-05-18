@@ -242,6 +242,14 @@ pub struct OutputRow {
     pub total_packets: usize,
     pub vote_packets: usize,
     pub cert_packets: usize,
+
+    pub sigverify_total_us: u64,
+    pub sigverify_avg_us_per_slot: f64,
+    pub sigverify_max_us_per_slot: u64,
+    pub sigverify_max_slot: u64,
+    pub sigverify_threads_needed_avg: f64,
+    pub sigverify_threads_needed_max: f64,
+
     pub elapsed_us: u64,
     pub per_packet_us: u64,
 }
