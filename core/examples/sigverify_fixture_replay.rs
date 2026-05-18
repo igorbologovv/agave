@@ -13,6 +13,7 @@ use {
         init_example_context, load_workload_from_file, make_timed_batches, print_results,
         reshuffle_workload_for_replay, validate_replay_config,
     },
+    solana_core::bls_sigverify::bls_sigverifier::PerSlotTiming,
     std::{
         sync::{
             Arc,
@@ -137,9 +138,15 @@ fn main() {
     let exit = Arc::new(AtomicBool::new(false));
     let verifier_exit = Arc::clone(&exit);
 
+    let timing = PerSlotTiming::new(workload.base_slot, workload.num_slots);
+
     let verifier_thread = thread::Builder::new()
         .name("sigverify-fixture-replay".to_string())
-        .spawn(move || verifier.run(verifier_exit))
+        .spawn(move || {
+            let mut timing = timing;
+            verifier.run_with_per_slot_timing(verifier_exit, &mut timing);
+            timing
+        })
         .expect("failed to spawn verifier thread");
 
     let replay_start = Instant::now();
@@ -191,9 +198,11 @@ fn main() {
     exit.store(true, Ordering::Relaxed);
     drop(packet_sender);
 
-    verifier_thread
+    let timing = verifier_thread
         .join()
         .expect("verifier thread panicked during replay");
+
+    let timing_summary = timing.summary();
 
     let elapsed_us = elapsed_us_since(replay_start);
 
@@ -226,6 +235,18 @@ fn main() {
         elapsed_us / workload.total_packets as u64
     };
 
+    let sigverify_threads_needed_avg = if workload.slot_window_us == 0 {
+        0.0
+    } else {
+        timing_summary.avg_us_per_slot / workload.slot_window_us as f64
+    };
+
+    let sigverify_threads_needed_max = if workload.slot_window_us == 0 {
+        0.0
+    } else {
+        timing_summary.max_us_per_slot as f64 / workload.slot_window_us as f64
+    };
+
     let row = OutputRow {
         seed: workload.seed,
         arrival_pattern: config.arrival_pattern,
@@ -246,6 +267,14 @@ fn main() {
         total_packets: workload.total_packets,
         vote_packets: workload.vote_packets,
         cert_packets: workload.cert_packets,
+
+        sigverify_total_us: timing_summary.total_us,
+        sigverify_avg_us_per_slot: timing_summary.avg_us_per_slot,
+        sigverify_max_us_per_slot: timing_summary.max_us_per_slot,
+        sigverify_max_slot: timing_summary.max_slot,
+        sigverify_threads_needed_avg,
+        sigverify_threads_needed_max,
+
         elapsed_us,
         per_packet_us,
     };
