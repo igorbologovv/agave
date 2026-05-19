@@ -5,7 +5,7 @@ use {
         bls_cert_sigverify::{CertPayload, verify_and_send_certificates},
         bls_vote_sigverify::{VotePayload, verify_and_send_votes},
         errors::SigVerifyError,
-        stats::SigVerifierStats,
+        stats::{SigVerifierStats, SigVerifyCertStats},
     },
     crate::cluster_info_vote_listener::VerifiedVoterSlotsSender,
     agave_votor::{
@@ -18,7 +18,7 @@ use {
         migration::MigrationStatus,
         reward_certificate::AddVoteMessage,
     },
-    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError},
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounded},
     rayon::{ThreadPool, ThreadPoolBuilder},
     solana_bls_signatures::pubkey::PubkeyAffine as BlsPubkeyAffine,
     solana_clock::Slot,
@@ -49,6 +49,9 @@ pub(super) const NUM_SLOTS_FOR_VERIFY: Slot = 90_000;
 /// If we receive an invalid certificate or vote from a QUIC connection, we ban the sender.
 /// We ban the sender for 2 days which roughly corresponds to an epoch
 pub(super) const BAN_TIMEOUT: Duration = Duration::from_hours(48);
+
+const CERT_WORKER_CHANNEL_CAPACITY: usize = 256;
+const CERT_WORKER_REPLY_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug)]
 pub struct PerSlotTiming {
@@ -204,6 +207,144 @@ impl SigVerifierChannels {
     }
 }
 
+type CertJobResult = Result<SigVerifyCertStats, SigVerifyError>;
+
+struct CertJob {
+    certs_to_verify: Vec<CertPayload>,
+    root_bank: Arc<Bank>,
+}
+
+enum CertWorkerMsg {
+    Job(CertJob),
+    Shutdown,
+}
+
+struct CertWorkerHandle {
+    tx: Sender<CertWorkerMsg>,
+    reply_rx: Receiver<CertJobResult>,
+    join_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl CertWorkerHandle {
+    fn shutdown(&mut self) {
+        let _ = self.tx.send(CertWorkerMsg::Shutdown);
+
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
+    }
+}
+
+fn spawn_cert_worker(
+    banlist: Arc<SimpleQosBanlist>,
+    channel_to_pool: Sender<Vec<ConsensusMessage>>,
+) -> CertWorkerHandle {
+    let (tx, rx) = bounded::<CertWorkerMsg>(CERT_WORKER_CHANNEL_CAPACITY);
+    let (reply_tx, reply_rx) = bounded::<CertJobResult>(CERT_WORKER_REPLY_CHANNEL_CAPACITY);
+
+    let join_handle = Builder::new()
+        .name("solSigVerCert".to_string())
+        .spawn(move || {
+            let cert_thread_pool = ThreadPoolBuilder::new()
+                .num_threads(1)
+                .thread_name(|i| format!("solSigVerCert{i:02}"))
+                .build()
+                .unwrap();
+
+            // The cert worker owns the global certificate dedup state.
+            let mut seen_certs = HashSet::<CertificateType>::new();
+            let mut last_checked_root_slot: Slot = 0;
+            let mut job_id = 0u64;
+
+            // Summary counters. One final log only, so this does not distort perf like per-job logs.
+            let mut total_input_payloads = 0u64;
+            let mut total_skipped_seen = 0u64;
+            let mut total_sent_to_verify = 0u64;
+            let mut total_valid_messages = 0u64;
+            let mut total_signature_failed = 0u64;
+            let mut total_stake_failed = 0u64;
+            let mut total_too_far_future = 0u64;
+            let mut total_unnecessary = 0u64;
+
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    CertWorkerMsg::Job(job) => {
+                        job_id = job_id.saturating_add(1);
+
+                        let root_slot = job.root_bank.slot();
+
+                        if last_checked_root_slot < root_slot {
+                            last_checked_root_slot = root_slot;
+                            seen_certs.retain(|cert| cert.slot() > root_slot);
+                        }
+
+                        let input_payloads = job.certs_to_verify.len();
+                        total_input_payloads =
+                            total_input_payloads.saturating_add(input_payloads as u64);
+
+                        let result = verify_and_send_certificates(
+                            &mut seen_certs,
+                            job.certs_to_verify,
+                            &job.root_bank,
+                            &channel_to_pool,
+                            &banlist,
+                            &cert_thread_pool,
+                        )
+                        .map_err(SigVerifyError::from);
+
+                        if let Ok(stats) = &result {
+                            let skipped_seen = input_payloads
+                                .saturating_sub(stats.certs_to_sig_verify as usize);
+
+                            total_skipped_seen =
+                                total_skipped_seen.saturating_add(skipped_seen as u64);
+                            total_sent_to_verify =
+                                total_sent_to_verify.saturating_add(stats.certs_to_sig_verify);
+                            total_valid_messages =
+                                total_valid_messages.saturating_add(stats.sig_verified_certs);
+                            total_signature_failed = total_signature_failed
+                                .saturating_add(stats.signature_verification_failed);
+                            total_stake_failed =
+                                total_stake_failed.saturating_add(stats.stake_verification_failed);
+                            total_too_far_future =
+                                total_too_far_future.saturating_add(stats.too_far_in_future);
+                            total_unnecessary =
+                                total_unnecessary.saturating_add(stats.unnecessary_certs_verified);
+                        }
+
+                        if reply_tx.send(result).is_err() {
+                            break;
+                        }
+                    }
+                    CertWorkerMsg::Shutdown => {
+                        eprintln!(
+                            "[cert-worker-summary] jobs={}, input_payloads={}, skipped_seen={}, sent_to_verify={}, valid_messages={}, signature_failed={}, stake_failed={}, too_far_future={}, unnecessary={}, seen_cache_size={}",
+                            job_id,
+                            total_input_payloads,
+                            total_skipped_seen,
+                            total_sent_to_verify,
+                            total_valid_messages,
+                            total_signature_failed,
+                            total_stake_failed,
+                            total_too_far_future,
+                            total_unnecessary,
+                            seen_certs.len(),
+                        );
+
+                        break;
+                    }
+                }
+            }
+        })
+        .unwrap();
+
+    CertWorkerHandle {
+        tx,
+        reply_rx,
+        join_handle: Some(join_handle),
+    }
+}
+
 /// Starts the BLS sigverifier service in its own dedicated thread.
 pub(crate) fn spawn_service(
     exit: Arc<AtomicBool>,
@@ -225,14 +366,12 @@ pub struct SigVerifier {
     /// Container to look up root banks from.
     sharable_banks: SharableBanks,
     stats: SigVerifierStats,
-    /// Set of recently verified certs to avoid duplicate work.
-    verified_certs: HashSet<CertificateType>,
-    /// Tracks when the cache was last pruned.
-    last_checked_root_slot: Slot,
     cluster_info: Arc<ClusterInfo>,
     leader_schedule: Arc<LeaderScheduleCache>,
-    /// thread pool to use for all parallel tasks
+    /// Thread pool to use for vote-side parallel work.
     thread_pool: ThreadPool,
+    /// Dedicated long-lived thread for certificate-side processing.
+    cert_worker: CertWorkerHandle,
     generated_cert_types: Arc<GeneratedCertTypes>,
 }
 
@@ -254,6 +393,11 @@ impl SigVerifier {
             .build()
             .unwrap();
 
+        let cert_worker = spawn_cert_worker(
+            Arc::clone(&banlist),
+            channels.channel_to_pool.clone(),
+        );
+
         let root_slot = sharable_banks.root().slot();
 
         Self {
@@ -262,11 +406,10 @@ impl SigVerifier {
             channels,
             sharable_banks,
             stats: SigVerifierStats::new(root_slot),
-            verified_certs: HashSet::new(),
-            last_checked_root_slot: 0,
             cluster_info,
             leader_schedule,
             thread_pool,
+            cert_worker,
             generated_cert_types,
         }
     }
@@ -346,7 +489,6 @@ impl SigVerifier {
         let module_start = timing.as_ref().map(|_| Instant::now());
 
         let root_bank = self.sharable_banks.root();
-        self.maybe_prune_caches(root_bank.slot());
 
         let ((certs_to_verify, votes_to_verify), extract_msgs_us) =
             measure_us!(self.extract_and_filter_msgs(batches, &root_bank));
@@ -367,32 +509,29 @@ impl SigVerifier {
             .extract_filter_msgs_us
             .add_sample(extract_msgs_us);
 
-        let (votes_result, certs_result) = self.thread_pool.join(
-            || {
-                verify_and_send_votes(
-                    votes_to_verify,
-                    &root_bank,
-                    &self.cluster_info,
-                    &self.leader_schedule,
-                    &self.banlist,
-                    &self.thread_pool,
-                    &self.channels,
-                )
-            },
-            || {
-                verify_and_send_certificates(
-                    &mut self.verified_certs,
-                    certs_to_verify,
-                    &root_bank,
-                    &self.channels.channel_to_pool,
-                    &self.banlist,
-                    &self.thread_pool,
-                )
-            },
-        );
+        self.cert_worker
+            .tx
+            .send(CertWorkerMsg::Job(CertJob {
+                certs_to_verify,
+                root_bank: Arc::clone(&root_bank),
+            }))
+            .map_err(|_| SigVerifyError::CertWorkerDisconnected)?;
 
-        let vote_stats = votes_result?;
-        let cert_stats = certs_result?;
+        let vote_stats = verify_and_send_votes(
+            votes_to_verify,
+            &root_bank,
+            &self.cluster_info,
+            &self.leader_schedule,
+            &self.banlist,
+            &self.thread_pool,
+            &self.channels,
+        )?;
+
+        let cert_stats = self
+            .cert_worker
+            .reply_rx
+            .recv()
+            .map_err(|_| SigVerifyError::CertWorkerReplyDisconnected)??;
 
         self.stats.vote_stats.merge(vote_stats);
         self.stats.cert_stats.merge(cert_stats);
@@ -403,13 +542,6 @@ impl SigVerifier {
         }
 
         Ok(())
-    }
-
-    fn maybe_prune_caches(&mut self, root_slot: Slot) {
-        if self.last_checked_root_slot < root_slot {
-            self.last_checked_root_slot = root_slot;
-            self.verified_certs.retain(|cert| cert.slot() > root_slot);
-        }
     }
 
     fn extract_and_filter_msgs(
@@ -457,11 +589,6 @@ impl SigVerifier {
                         && cert.cert_type.slot() <= root_slot
                     {
                         self.stats.num_old_certs_received += 1;
-                        continue;
-                    }
-
-                    if self.verified_certs.contains(&cert.cert_type) {
-                        self.stats.num_verified_certs_received += 1;
                         continue;
                     }
 
@@ -515,6 +642,12 @@ impl SigVerifier {
 
         self.stats.num_old_votes_received += 1;
         None
+    }
+}
+
+impl Drop for SigVerifier {
+    fn drop(&mut self) {
+        self.cert_worker.shutdown();
     }
 }
 
