@@ -53,6 +53,21 @@ pub(super) const BAN_TIMEOUT: Duration = Duration::from_hours(48);
 const CERT_WORKER_CHANNEL_CAPACITY: usize = 256;
 const CERT_WORKER_REPLY_CHANNEL_CAPACITY: usize = 64;
 
+#[derive(Debug, Default)]
+struct VoteDebugCounters {
+    input_messages: u64,
+    kept_after_prefilter: u64,
+
+    discard_no_epoch_stakes: u64,
+    discard_invalid_rank: u64,
+    discard_old_votes: u64,
+
+    sent_to_sigverify: u64,
+    sig_verified: u64,
+    signature_failed: u64,
+    too_far_future: u64,
+}
+
 #[derive(Debug)]
 pub struct PerSlotTiming {
     base_slot: Slot,
@@ -112,8 +127,7 @@ impl PerSlotTiming {
                 first_nonzero_index = Some(index);
             }
 
-            let slot_us =
-                ((elapsed_us as u128 * count as u128) / total_messages as u128) as u64;
+            let slot_us = ((elapsed_us as u128 * count as u128) / total_messages as u128) as u64;
 
             self.per_slot_us[index] = self.per_slot_us[index].saturating_add(slot_us);
             assigned_us = assigned_us.saturating_add(slot_us);
@@ -373,6 +387,7 @@ pub struct SigVerifier {
     /// Dedicated long-lived thread for certificate-side processing.
     cert_worker: CertWorkerHandle,
     generated_cert_types: Arc<GeneratedCertTypes>,
+    vote_debug: VoteDebugCounters,
 }
 
 impl SigVerifier {
@@ -393,10 +408,7 @@ impl SigVerifier {
             .build()
             .unwrap();
 
-        let cert_worker = spawn_cert_worker(
-            Arc::clone(&banlist),
-            channels.channel_to_pool.clone(),
-        );
+        let cert_worker = spawn_cert_worker(Arc::clone(&banlist), channels.channel_to_pool.clone());
 
         let root_slot = sharable_banks.root().slot();
 
@@ -411,6 +423,7 @@ impl SigVerifier {
             thread_pool,
             cert_worker,
             generated_cert_types,
+            vote_debug: VoteDebugCounters::default(),
         }
     }
 
@@ -418,19 +431,11 @@ impl SigVerifier {
         self.run_impl(exit, None);
     }
 
-    pub fn run_with_per_slot_timing(
-        self,
-        exit: Arc<AtomicBool>,
-        timing: &mut PerSlotTiming,
-    ) {
+    pub fn run_with_per_slot_timing(self, exit: Arc<AtomicBool>, timing: &mut PerSlotTiming) {
         self.run_impl(exit, Some(timing));
     }
 
-    fn run_impl(
-        mut self,
-        exit: Arc<AtomicBool>,
-        mut timing: Option<&mut PerSlotTiming>,
-    ) {
+    fn run_impl(mut self, exit: Arc<AtomicBool>, mut timing: Option<&mut PerSlotTiming>) {
         while !exit.load(Ordering::Relaxed) {
             const SOFT_RECEIVE_CAP: usize = 5000;
 
@@ -463,6 +468,7 @@ impl SigVerifier {
             self.stats.maybe_report(self.sharable_banks.root().slot());
         }
 
+        self.print_vote_debug_summary();
         self.stats.do_report(self.sharable_banks.root().slot());
     }
 
@@ -527,6 +533,31 @@ impl SigVerifier {
             &self.channels,
         )?;
 
+        let signature_failed = vote_stats
+            .votes_to_sig_verify
+            .saturating_sub(vote_stats.too_far_in_future)
+            .saturating_sub(vote_stats.sig_verified_votes);
+
+        self.vote_debug.sent_to_sigverify = self
+            .vote_debug
+            .sent_to_sigverify
+            .saturating_add(vote_stats.votes_to_sig_verify);
+
+        self.vote_debug.sig_verified = self
+            .vote_debug
+            .sig_verified
+            .saturating_add(vote_stats.sig_verified_votes);
+
+        self.vote_debug.too_far_future = self
+            .vote_debug
+            .too_far_future
+            .saturating_add(vote_stats.too_far_in_future);
+
+        self.vote_debug.signature_failed = self
+            .vote_debug
+            .signature_failed
+            .saturating_add(signature_failed);
+
         let cert_stats = self
             .cert_worker
             .reply_rx
@@ -575,7 +606,13 @@ impl SigVerifier {
 
             match msg {
                 ConsensusMessage::Vote(vote) => {
+                    self.vote_debug.input_messages =
+                        self.vote_debug.input_messages.saturating_add(1);
+
                     if let Some((pubkey, bls_pubkey)) = self.keep_vote(&vote, root_bank) {
+                        self.vote_debug.kept_after_prefilter =
+                            self.vote_debug.kept_after_prefilter.saturating_add(1);
+
                         votes.push(VotePayload {
                             vote_message: vote,
                             bls_pubkey,
@@ -619,6 +656,8 @@ impl SigVerifier {
 
         let Some(rank_map) = root_bank.get_rank_map(vote.vote.slot()) else {
             self.stats.discard_vote_no_epoch_stakes += 1;
+            self.vote_debug.discard_no_epoch_stakes =
+                self.vote_debug.discard_no_epoch_stakes.saturating_add(1);
             return None;
         };
 
@@ -626,6 +665,8 @@ impl SigVerifier {
             .get_pubkey_stake_entry(vote.rank.into())
             .or_else(|| {
                 self.stats.discard_vote_invalid_rank += 1;
+                self.vote_debug.discard_invalid_rank =
+                    self.vote_debug.discard_invalid_rank.saturating_add(1);
                 None
             })?;
 
@@ -641,7 +682,23 @@ impl SigVerifier {
         }
 
         self.stats.num_old_votes_received += 1;
+        self.vote_debug.discard_old_votes = self.vote_debug.discard_old_votes.saturating_add(1);
         None
+    }
+
+    fn print_vote_debug_summary(&self) {
+        eprintln!(
+            "[vote-summary] input_messages={}, kept_after_prefilter={}, discard_no_epoch_stakes={}, discard_invalid_rank={}, discard_old_votes={}, sent_to_sigverify={}, sig_verified={}, signature_failed={}, too_far_future={}",
+            self.vote_debug.input_messages,
+            self.vote_debug.kept_after_prefilter,
+            self.vote_debug.discard_no_epoch_stakes,
+            self.vote_debug.discard_invalid_rank,
+            self.vote_debug.discard_old_votes,
+            self.vote_debug.sent_to_sigverify,
+            self.vote_debug.sig_verified,
+            self.vote_debug.signature_failed,
+            self.vote_debug.too_far_future,
+        );
     }
 }
 
