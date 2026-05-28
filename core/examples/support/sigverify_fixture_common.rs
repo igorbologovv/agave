@@ -300,7 +300,8 @@ pub fn validate_fixture_build_config(config: &FixtureBuildConfig) -> Result<(), 
 
     if config.num_validators < CERT_SIGNERS {
         return Err(format!(
-            "num_validators must be >= {CERT_SIGNERS} so synthetic certificates have enough signers"
+            "num_validators must be >= {CERT_SIGNERS} so synthetic certificates have enough \
+             signers"
         ));
     }
 
@@ -987,7 +988,8 @@ pub fn load_workload_from_file<P: AsRef<Path>>(
         Ok(workload) => Ok(workload),
         Err(current_err) => {
             eprintln!(
-                "warning: failed to load fixture as current format: {current_err}; trying legacy format"
+                "warning: failed to load fixture as current format: {current_err}; trying legacy \
+                 format"
             );
 
             load_legacy_workload_from_file(path)

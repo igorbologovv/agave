@@ -95,7 +95,8 @@ fn main() {
             config.debug_batches,
         ) {
             eprintln!(
-                "debug batch #{:04}: send_at_us={}, packets={}, votes={}, certs={}, first_arrival_us={}, last_arrival_us={}",
+                "debug batch #{:04}: send_at_us={}, packets={}, votes={}, certs={}, \
+                 first_arrival_us={}, last_arrival_us={}",
                 batch.index,
                 batch.send_at_us,
                 batch.packet_count,
@@ -108,11 +109,9 @@ fn main() {
     }
 
     eprintln!(
-        "Prepare phase is over; Start paced replay (arrival_pattern={:?}, emitted_batches={}, avg_packets_per_batch={:.2}, scheduled_end_us={})",
-        config.arrival_pattern,
-        emitted_batches,
-        avg_packets_per_batch,
-        scheduled_end_us,
+        "Prepare phase is over; Start paced replay (arrival_pattern={:?}, emitted_batches={}, \
+         avg_packets_per_batch={:.2}, scheduled_end_us={})",
+        config.arrival_pattern, emitted_batches, avg_packets_per_batch, scheduled_end_us,
     );
 
     let max_slot = fixture_max_slot(workload.base_slot, workload.num_slots);
@@ -180,7 +179,8 @@ fn main() {
 
         if index < config.debug_batches {
             eprintln!(
-                "debug send #{:04}: scheduled_send_at_us={}, before_send_us={}, actual_send_end_us={}, schedule_lag_us={}, send_block_us={}",
+                "debug send #{:04}: scheduled_send_at_us={}, before_send_us={}, \
+                 actual_send_end_us={}, schedule_lag_us={}, send_block_us={}",
                 index,
                 timed_batch.send_at_us,
                 before_send_us,
@@ -207,7 +207,9 @@ fn main() {
     let elapsed_us = elapsed_us_since(replay_start);
 
     eprintln!(
-        "send schedule: scheduled_end_us={}, actual_send_end_us={}, send_lag_us={}, max_schedule_lag_us={}, max_send_block_us={}, total_send_block_us={}, blocked_sends_over_100us={}",
+        "send schedule: scheduled_end_us={}, actual_send_end_us={}, send_lag_us={}, \
+         max_schedule_lag_us={}, max_send_block_us={}, total_send_block_us={}, \
+         blocked_sends_over_100us={}",
         scheduled_end_us,
         actual_send_end_us,
         actual_send_end_us.saturating_sub(scheduled_end_us),

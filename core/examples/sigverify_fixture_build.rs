@@ -37,7 +37,8 @@ fn main() {
     let workload = build_stored_workload(&ctx, &config);
 
     eprintln!(
-        "Writing fixture: output={}, slots={}, votes_per_slot={}, certs_per_slot={}, total_packets={}",
+        "Writing fixture: output={}, slots={}, votes_per_slot={}, certs_per_slot={}, \
+         total_packets={}",
         config.output,
         workload.num_slots,
         workload.votes_per_slot,

@@ -306,8 +306,8 @@ fn spawn_cert_worker(
                         .map_err(SigVerifyError::from);
 
                         if let Ok(stats) = &result {
-                            let skipped_seen = input_payloads
-                                .saturating_sub(stats.certs_to_sig_verify as usize);
+                            let skipped_seen =
+                                input_payloads.saturating_sub(stats.certs_to_sig_verify as usize);
 
                             total_skipped_seen =
                                 total_skipped_seen.saturating_add(skipped_seen as u64);
@@ -331,7 +331,10 @@ fn spawn_cert_worker(
                     }
                     CertWorkerMsg::Shutdown => {
                         eprintln!(
-                            "[cert-worker-summary] jobs={}, input_payloads={}, skipped_seen={}, sent_to_verify={}, valid_messages={}, signature_failed={}, stake_failed={}, too_far_future={}, unnecessary={}, seen_cache_size={}",
+                            "[cert-worker-summary] jobs={}, input_payloads={}, skipped_seen={}, \
+                             sent_to_verify={}, valid_messages={}, signature_failed={}, \
+                             stake_failed={}, too_far_future={}, unnecessary={}, \
+                             seen_cache_size={}",
                             job_id,
                             total_input_payloads,
                             total_skipped_seen,
@@ -687,7 +690,9 @@ impl SigVerifier {
 
     fn print_vote_debug_summary(&self) {
         eprintln!(
-            "[vote-summary] input_messages={}, kept_after_prefilter={}, discard_no_epoch_stakes={}, discard_invalid_rank={}, discard_old_votes={}, sent_to_sigverify={}, sig_verified={}, signature_failed={}, too_far_future={}",
+            "[vote-summary] input_messages={}, kept_after_prefilter={}, \
+             discard_no_epoch_stakes={}, discard_invalid_rank={}, discard_old_votes={}, \
+             sent_to_sigverify={}, sig_verified={}, signature_failed={}, too_far_future={}",
             self.vote_debug.input_messages,
             self.vote_debug.kept_after_prefilter,
             self.vote_debug.discard_no_epoch_stakes,
