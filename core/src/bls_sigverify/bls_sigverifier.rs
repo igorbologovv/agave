@@ -52,114 +52,115 @@ pub(super) const BAN_TIMEOUT: Duration = Duration::from_hours(48);
 const CERT_WORKER_CHANNEL_CAPACITY: usize = 256;
 const CERT_WORKER_REPLY_CHANNEL_CAPACITY: usize = 64;
 
-#[derive(Debug, Default)]
-struct VoteDebugCounters {
-    input_messages: u64,
-    kept_after_prefilter: u64,
+/// Raw facts produced by one verifier drain/verify job.
+///
+/// This type is intentionally not a benchmark tracker and not a formatted report.
+/// Replay/examples can consume these events and build benchmark-specific stats outside
+/// the production verifier.
+#[derive(Debug, Clone)]
+pub struct VerifyBatchSummary {
+    pub root_slot: Slot,
 
-    discard_no_epoch_stakes: u64,
-    discard_invalid_rank: u64,
-    discard_old_votes: u64,
+    pub received_batches: usize,
+    pub non_empty_batches: usize,
+    pub input_packets: u64,
+    pub max_packets_in_batch: usize,
 
-    sent_to_sigverify: u64,
-    sig_verified: u64,
-    signature_failed: u64,
-    too_far_future: u64,
+    pub batches_with_kept_votes: usize,
+    pub batches_with_kept_certs: usize,
+    pub batches_with_kept_votes_and_certs: usize,
+
+    pub raw_vote_messages: u64,
+    pub raw_cert_messages: u64,
+
+    /// Votes accepted by prefilter and sent into vote verification.
+    pub votes_to_verify: u64,
+
+    /// Cert payloads accepted by prefilter and sent to the cert worker.
+    pub certs_to_verify: u64,
+
+    /// Cert payloads that survived cert-worker seen-cache dedup and reached signature verify.
+    pub certs_sent_to_sigverify: u64,
+
+    /// Cert payloads skipped by cert-worker seen-cache dedup.
+    pub certs_skipped_seen: u64,
+
+    pub discarded_packets: u64,
+    pub malformed_packets: u64,
+    pub missing_remote_pubkey: u64,
+    pub old_certs: u64,
+    pub generated_certs: u64,
+
+    pub extract_filter_us: u64,
+    pub cert_worker_send_us: u64,
+    pub vote_path_us: u64,
+    pub cert_reply_wait_us: u64,
+    pub module_us: u64,
+
+    pub configured_vote_threads: usize,
+
+    pub sig_verified_votes: u64,
+    pub vote_signature_failed: u64,
+    pub vote_too_far_future: u64,
+
+    pub cert_sig_verified: u64,
+    pub cert_signature_failed: u64,
+    pub cert_stake_failed: u64,
+    pub cert_too_far_future: u64,
+    pub cert_unnecessary: u64,
+
+    /// Timestamp captured immediately after vote verification finishes.
+    ///
+    /// Replay uses this to compute PacketBatch send -> vote-done latency while keeping
+    /// the latency tracker outside this production verifier file.
+    pub vote_done_at: Instant,
+
+    /// Slot distribution of accepted votes/certs in this verifier job.
+    ///
+    /// Replay uses this to approximate per-slot verifier cost.
+    #[cfg(feature = "dev-context-only-utils")]
+    pub slot_message_counts: Vec<(Slot, u64)>,
 }
 
-#[derive(Debug)]
-pub struct PerSlotTiming {
-    base_slot: Slot,
-    per_slot_us: Vec<u64>,
-    scratch_counts: Vec<u64>,
+#[derive(Debug, Default, Clone)]
+struct ExtractAndFilterSummary {
+    received_batches: usize,
+    non_empty_batches: usize,
+    input_packets: u64,
+    max_packets_in_batch: usize,
+
+    batches_with_kept_votes: usize,
+    batches_with_kept_certs: usize,
+    batches_with_kept_votes_and_certs: usize,
+
+    raw_vote_messages: u64,
+    raw_cert_messages: u64,
+
+    kept_votes: u64,
+    kept_certs: u64,
+
+    discarded_packets: u64,
+    malformed_packets: u64,
+    missing_remote_pubkey: u64,
+    old_certs: u64,
+    generated_certs: u64,
+
+    #[cfg(feature = "dev-context-only-utils")]
+    slot_message_counts: Vec<(Slot, u64)>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PerSlotTimingSummary {
-    pub total_us: u64,
-    pub avg_us_per_slot: f64,
-    pub max_us_per_slot: u64,
-    pub max_slot: Slot,
-}
-
-impl PerSlotTiming {
-    pub fn new(base_slot: Slot, num_slots: usize) -> Self {
-        Self {
-            base_slot,
-            per_slot_us: vec![0; num_slots],
-            scratch_counts: vec![0; num_slots],
-        }
+#[cfg(feature = "dev-context-only-utils")]
+fn count_slot(summary: &mut ExtractAndFilterSummary, slot: Slot) {
+    if let Some((_, count)) = summary
+        .slot_message_counts
+        .iter_mut()
+        .find(|(existing_slot, _)| *existing_slot == slot)
+    {
+        *count = count.saturating_add(1);
+        return;
     }
 
-    fn clear_current(&mut self) {
-        self.scratch_counts.fill(0);
-    }
-
-    fn count_slot(&mut self, slot: Slot) {
-        let Some(offset) = slot.checked_sub(self.base_slot) else {
-            return;
-        };
-
-        let index = offset as usize;
-
-        if let Some(count) = self.scratch_counts.get_mut(index) {
-            *count = count.saturating_add(1);
-        }
-    }
-
-    fn add_elapsed_for_current(&mut self, elapsed_us: u64) {
-        let total_messages: u64 = self.scratch_counts.iter().sum();
-
-        if total_messages == 0 || elapsed_us == 0 {
-            return;
-        }
-
-        let mut assigned_us = 0u64;
-        let mut first_nonzero_index = None;
-
-        for (index, count) in self.scratch_counts.iter().copied().enumerate() {
-            if count == 0 {
-                continue;
-            }
-
-            if first_nonzero_index.is_none() {
-                first_nonzero_index = Some(index);
-            }
-
-            let slot_us = ((elapsed_us as u128 * count as u128) / total_messages as u128) as u64;
-
-            self.per_slot_us[index] = self.per_slot_us[index].saturating_add(slot_us);
-            assigned_us = assigned_us.saturating_add(slot_us);
-        }
-
-        if let Some(index) = first_nonzero_index {
-            let remainder_us = elapsed_us.saturating_sub(assigned_us);
-            self.per_slot_us[index] = self.per_slot_us[index].saturating_add(remainder_us);
-        }
-    }
-
-    pub fn summary(&self) -> PerSlotTimingSummary {
-        if self.per_slot_us.is_empty() {
-            return PerSlotTimingSummary::default();
-        }
-
-        let total_us: u64 = self.per_slot_us.iter().sum();
-
-        let (max_index, max_us_per_slot) = self
-            .per_slot_us
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by_key(|(_, value)| *value)
-            .unwrap_or((0, 0));
-
-        PerSlotTimingSummary {
-            total_us,
-            avg_us_per_slot: total_us as f64 / self.per_slot_us.len() as f64,
-            max_us_per_slot,
-            max_slot: self.base_slot + max_index as Slot,
-        }
-    }
+    summary.slot_message_counts.push((slot, 1));
 }
 
 pub struct SigVerifierContext {
@@ -264,36 +265,18 @@ fn spawn_cert_worker(
                 .build()
                 .unwrap();
 
-            // The cert worker owns the global certificate dedup state.
             let mut seen_certs = HashSet::<CertificateType>::new();
             let mut last_checked_root_slot: Slot = 0;
-            let mut job_id = 0u64;
-
-            // Summary counters. One final log only, so this does not distort perf like per-job logs.
-            let mut total_input_payloads = 0u64;
-            let mut total_skipped_seen = 0u64;
-            let mut total_sent_to_verify = 0u64;
-            let mut total_valid_messages = 0u64;
-            let mut total_signature_failed = 0u64;
-            let mut total_stake_failed = 0u64;
-            let mut total_too_far_future = 0u64;
-            let mut total_unnecessary = 0u64;
 
             while let Ok(msg) = rx.recv() {
                 match msg {
                     CertWorkerMsg::Job(job) => {
-                        job_id = job_id.saturating_add(1);
-
                         let root_slot = job.root_bank.slot();
 
                         if last_checked_root_slot < root_slot {
                             last_checked_root_slot = root_slot;
                             seen_certs.retain(|cert| cert.slot() > root_slot);
                         }
-
-                        let input_payloads = job.certs_to_verify.len();
-                        total_input_payloads =
-                            total_input_payloads.saturating_add(input_payloads as u64);
 
                         let result = verify_and_send_certificates(
                             &mut seen_certs,
@@ -305,50 +288,11 @@ fn spawn_cert_worker(
                         )
                         .map_err(SigVerifyError::from);
 
-                        if let Ok(stats) = &result {
-                            let skipped_seen =
-                                input_payloads.saturating_sub(stats.certs_to_sig_verify as usize);
-
-                            total_skipped_seen =
-                                total_skipped_seen.saturating_add(skipped_seen as u64);
-                            total_sent_to_verify =
-                                total_sent_to_verify.saturating_add(stats.certs_to_sig_verify);
-                            total_valid_messages =
-                                total_valid_messages.saturating_add(stats.sig_verified_certs);
-                            total_signature_failed = total_signature_failed
-                                .saturating_add(stats.signature_verification_failed);
-                            total_stake_failed =
-                                total_stake_failed.saturating_add(stats.stake_verification_failed);
-                            total_too_far_future =
-                                total_too_far_future.saturating_add(stats.too_far_in_future);
-                            total_unnecessary =
-                                total_unnecessary.saturating_add(stats.unnecessary_certs_verified);
-                        }
-
                         if reply_tx.send(result).is_err() {
                             break;
                         }
                     }
-                    CertWorkerMsg::Shutdown => {
-                        eprintln!(
-                            "[cert-worker-summary] jobs={}, input_payloads={}, skipped_seen={}, \
-                             sent_to_verify={}, valid_messages={}, signature_failed={}, \
-                             stake_failed={}, too_far_future={}, unnecessary={}, \
-                             seen_cache_size={}",
-                            job_id,
-                            total_input_payloads,
-                            total_skipped_seen,
-                            total_sent_to_verify,
-                            total_valid_messages,
-                            total_signature_failed,
-                            total_stake_failed,
-                            total_too_far_future,
-                            total_unnecessary,
-                            seen_certs.len(),
-                        );
-
-                        break;
-                    }
+                    CertWorkerMsg::Shutdown => break,
                 }
             }
         })
@@ -379,17 +323,13 @@ pub struct SigVerifier {
     migration_status: Arc<MigrationStatus>,
     banlist: Arc<SimpleQosBanlist>,
     channels: SigVerifierChannels,
-    /// Container to look up root banks from.
     sharable_banks: SharableBanks,
     stats: SigVerifierStats,
     cluster_info: Arc<ClusterInfo>,
     leader_schedule: Arc<LeaderScheduleCache>,
-    /// Thread pool to use for vote-side parallel work.
     thread_pool: ThreadPool,
-    /// Dedicated long-lived thread for certificate-side processing.
     cert_worker: CertWorkerHandle,
     generated_cert_types: Arc<GeneratedCertTypes>,
-    vote_debug: VoteDebugCounters,
 }
 
 impl SigVerifier {
@@ -425,7 +365,6 @@ impl SigVerifier {
             thread_pool,
             cert_worker,
             generated_cert_types,
-            vote_debug: VoteDebugCounters::default(),
         }
     }
 
@@ -433,16 +372,25 @@ impl SigVerifier {
         self.run_impl(exit, None);
     }
 
-    pub fn run_with_per_slot_timing(self, exit: Arc<AtomicBool>, timing: &mut PerSlotTiming) {
-        self.run_impl(exit, Some(timing));
+    /// Runs the verifier and emits one raw summary per verifier job.
+    ///
+    /// This is intended for replay/harness code. The verifier still owns only the
+    /// production pipeline; benchmark aggregation/reporting lives in examples.
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn run_for_replay(self, exit: Arc<AtomicBool>, summary_sender: Sender<VerifyBatchSummary>) {
+        self.run_impl(exit, Some(summary_sender));
     }
 
-    fn run_impl(mut self, exit: Arc<AtomicBool>, mut timing: Option<&mut PerSlotTiming>) {
+    fn run_impl(
+        mut self,
+        exit: Arc<AtomicBool>,
+        summary_sender: Option<Sender<VerifyBatchSummary>>,
+    ) {
         while !exit.load(Ordering::Relaxed) {
             const SOFT_RECEIVE_CAP: usize = 5000;
 
             let Ok(batches) = recv_batches(&self.channels.packet_receiver, SOFT_RECEIVE_CAP) else {
-                error!("packet_receiver disconnected:  Exiting.");
+                error!("packet_receiver disconnected: Exiting.");
                 break;
             };
 
@@ -453,79 +401,66 @@ impl SigVerifier {
                 continue;
             }
 
-            let (verify_res, verify_time_us) = measure_us!(match timing.as_deref_mut() {
-                Some(timing) => self.verify_and_send_batches_with_timing(batches, timing),
-                None => self.verify_and_send_batches(batches),
-            });
+            let (verify_res, verify_time_us) =
+                measure_us!(self.verify_and_send_batches_impl(batches));
 
             self.stats
                 .verify_and_send_batch_us
                 .add_sample(verify_time_us);
 
-            if let Err(e) = verify_res {
-                error!("verify_and_send_batch() failed with {e}. Exiting.");
-                break;
+            match verify_res {
+                Ok(summary) => {
+                    if let Some(summary_sender) = &summary_sender {
+                        let _ = summary_sender.send(summary);
+                    }
+                }
+                Err(e) => {
+                    error!("verify_and_send_batch() failed with {e}. Exiting.");
+                    break;
+                }
             }
 
             self.stats.maybe_report(self.sharable_banks.root().slot());
         }
 
-        self.print_vote_debug_summary();
         self.stats.do_report(self.sharable_banks.root().slot());
     }
 
-    pub fn verify_and_send_batches(
+    #[allow(dead_code)]
+    pub(super) fn verify_and_send_batches(
         &mut self,
         batches: Vec<PacketBatch>,
     ) -> Result<(), SigVerifyError> {
-        self.verify_and_send_batches_impl(batches, None)
-    }
-
-    pub fn verify_and_send_batches_with_timing(
-        &mut self,
-        batches: Vec<PacketBatch>,
-        timing: &mut PerSlotTiming,
-    ) -> Result<(), SigVerifyError> {
-        self.verify_and_send_batches_impl(batches, Some(timing))
+        self.verify_and_send_batches_impl(batches).map(|_| ())
     }
 
     fn verify_and_send_batches_impl(
         &mut self,
         batches: Vec<PacketBatch>,
-        mut timing: Option<&mut PerSlotTiming>,
-    ) -> Result<(), SigVerifyError> {
-        let module_start = timing.as_ref().map(|_| Instant::now());
+    ) -> Result<VerifyBatchSummary, SigVerifyError> {
+        let module_start = Instant::now();
 
         let root_bank = self.sharable_banks.root();
+        let root_slot = root_bank.slot();
 
-        let ((certs_to_verify, votes_to_verify), extract_msgs_us) =
+        let ((certs_to_verify, votes_to_verify, extract_summary), extract_filter_us) =
             measure_us!(self.extract_and_filter_msgs(batches, &root_bank));
-
-        if let Some(timing) = timing.as_deref_mut() {
-            timing.clear_current();
-
-            for vote in &votes_to_verify {
-                timing.count_slot(vote.vote_message.vote.slot());
-            }
-
-            for cert in &certs_to_verify {
-                timing.count_slot(cert.cert.cert_type.slot());
-            }
-        }
 
         self.stats
             .extract_filter_msgs_us
-            .add_sample(extract_msgs_us);
+            .add_sample(extract_filter_us);
 
-        self.cert_worker
-            .tx
-            .send(CertWorkerMsg::Job(CertJob {
+        let cert_worker_input_payloads = certs_to_verify.len() as u64;
+
+        let (cert_worker_send_result, cert_worker_send_us) =
+            measure_us!(self.cert_worker.tx.send(CertWorkerMsg::Job(CertJob {
                 certs_to_verify,
                 root_bank: Arc::clone(&root_bank),
-            }))
-            .map_err(|_| SigVerifyError::CertWorkerDisconnected)?;
+            })));
 
-        let vote_stats = verify_and_send_votes(
+        cert_worker_send_result.map_err(|_| SigVerifyError::CertWorkerDisconnected)?;
+
+        let (vote_result, vote_path_us) = measure_us!(verify_and_send_votes(
             votes_to_verify,
             &root_bank,
             &self.cluster_info,
@@ -533,120 +468,200 @@ impl SigVerifier {
             &self.banlist,
             &self.thread_pool,
             &self.channels,
-        )?;
+        ));
 
-        let signature_failed = vote_stats
+        let vote_stats = vote_result?;
+        let vote_done_at = Instant::now();
+
+        let vote_signature_failed = vote_stats
             .votes_to_sig_verify
             .saturating_sub(vote_stats.too_far_in_future)
             .saturating_sub(vote_stats.sig_verified_votes);
 
-        self.vote_debug.sent_to_sigverify = self
-            .vote_debug
-            .sent_to_sigverify
-            .saturating_add(vote_stats.votes_to_sig_verify);
+        let (cert_reply_result, cert_reply_wait_us) = measure_us!(self.cert_worker.reply_rx.recv());
 
-        self.vote_debug.sig_verified = self
-            .vote_debug
-            .sig_verified
-            .saturating_add(vote_stats.sig_verified_votes);
+        let cert_stats =
+            cert_reply_result.map_err(|_| SigVerifyError::CertWorkerReplyDisconnected)??;
 
-        self.vote_debug.too_far_future = self
-            .vote_debug
-            .too_far_future
-            .saturating_add(vote_stats.too_far_in_future);
+        let module_us = module_start.elapsed().as_micros() as u64;
 
-        self.vote_debug.signature_failed = self
-            .vote_debug
-            .signature_failed
-            .saturating_add(signature_failed);
+        let certs_skipped_seen =
+            cert_worker_input_payloads.saturating_sub(cert_stats.certs_to_sig_verify);
 
-        let cert_stats = self
-            .cert_worker
-            .reply_rx
-            .recv()
-            .map_err(|_| SigVerifyError::CertWorkerReplyDisconnected)??;
+        let summary = VerifyBatchSummary {
+            root_slot,
+
+            received_batches: extract_summary.received_batches,
+            non_empty_batches: extract_summary.non_empty_batches,
+            input_packets: extract_summary.input_packets,
+            max_packets_in_batch: extract_summary.max_packets_in_batch,
+
+            batches_with_kept_votes: extract_summary.batches_with_kept_votes,
+            batches_with_kept_certs: extract_summary.batches_with_kept_certs,
+            batches_with_kept_votes_and_certs: extract_summary.batches_with_kept_votes_and_certs,
+
+            raw_vote_messages: extract_summary.raw_vote_messages,
+            raw_cert_messages: extract_summary.raw_cert_messages,
+
+            votes_to_verify: extract_summary.kept_votes,
+            certs_to_verify: extract_summary.kept_certs,
+            certs_sent_to_sigverify: cert_stats.certs_to_sig_verify,
+            certs_skipped_seen,
+
+            discarded_packets: extract_summary.discarded_packets,
+            malformed_packets: extract_summary.malformed_packets,
+            missing_remote_pubkey: extract_summary.missing_remote_pubkey,
+            old_certs: extract_summary.old_certs,
+            generated_certs: extract_summary.generated_certs,
+
+            extract_filter_us,
+            cert_worker_send_us,
+            vote_path_us,
+            cert_reply_wait_us,
+            module_us,
+
+            configured_vote_threads: self.thread_pool.current_num_threads(),
+
+            sig_verified_votes: vote_stats.sig_verified_votes,
+            vote_signature_failed,
+            vote_too_far_future: vote_stats.too_far_in_future,
+
+            cert_sig_verified: cert_stats.sig_verified_certs,
+            cert_signature_failed: cert_stats.signature_verification_failed,
+            cert_stake_failed: cert_stats.stake_verification_failed,
+            cert_too_far_future: cert_stats.too_far_in_future,
+            cert_unnecessary: cert_stats.unnecessary_certs_verified,
+
+            vote_done_at,
+
+            #[cfg(feature = "dev-context-only-utils")]
+            slot_message_counts: extract_summary.slot_message_counts,
+        };
 
         self.stats.vote_stats.merge(vote_stats);
         self.stats.cert_stats.merge(cert_stats);
 
-        if let (Some(timing), Some(module_start)) = (timing, module_start) {
-            let elapsed_us = module_start.elapsed().as_micros() as u64;
-            timing.add_elapsed_for_current(elapsed_us);
-        }
-
-        Ok(())
+        Ok(summary)
     }
 
     fn extract_and_filter_msgs(
         &mut self,
         batches: Vec<PacketBatch>,
         root_bank: &Bank,
-    ) -> (Vec<CertPayload>, Vec<VotePayload>) {
+    ) -> (Vec<CertPayload>, Vec<VotePayload>, ExtractAndFilterSummary) {
         let root_slot = root_bank.slot();
+
         let mut certs = Vec::new();
         let mut votes = Vec::new();
-        let mut num_pkts = 0u64;
 
-        for packet in batches.iter().flatten() {
-            num_pkts = num_pkts.saturating_add(1);
+        let mut summary = ExtractAndFilterSummary {
+            received_batches: batches.len(),
+            ..ExtractAndFilterSummary::default()
+        };
 
-            if packet.meta().discard() {
-                self.stats.num_discarded_pkts += 1;
-                continue;
+        for batch in &batches {
+            let packets_in_batch = batch.len();
+
+            if packets_in_batch > 0 {
+                summary.non_empty_batches = summary.non_empty_batches.saturating_add(1);
             }
 
-            let Ok(msg) = packet.deserialize_slice::<ConsensusMessage, _>(..) else {
-                self.stats.num_malformed_pkts += 1;
-                continue;
-            };
+            summary.max_packets_in_batch = summary.max_packets_in_batch.max(packets_in_batch);
 
-            let Some(remote_pubkey) = packet.meta().remote_pubkey() else {
-                debug_assert!(false, "BLS packet missing remote pubkey");
-                self.stats.num_malformed_pkts += 1;
-                continue;
-            };
+            let mut batch_has_kept_vote = false;
+            let mut batch_has_kept_cert = false;
 
-            match msg {
-                ConsensusMessage::Vote(vote) => {
-                    self.vote_debug.input_messages =
-                        self.vote_debug.input_messages.saturating_add(1);
+            for packet in batch {
+                summary.input_packets = summary.input_packets.saturating_add(1);
 
-                    if let Some((pubkey, bls_pubkey)) = self.keep_vote(&vote, root_bank) {
-                        self.vote_debug.kept_after_prefilter =
-                            self.vote_debug.kept_after_prefilter.saturating_add(1);
+                if packet.meta().discard() {
+                    self.stats.num_discarded_pkts += 1;
+                    summary.discarded_packets = summary.discarded_packets.saturating_add(1);
+                    continue;
+                }
 
-                        votes.push(VotePayload {
-                            vote_message: vote,
-                            bls_pubkey,
-                            pubkey,
+                let Ok(msg) = packet.deserialize_slice::<ConsensusMessage, _>(..) else {
+                    self.stats.num_malformed_pkts += 1;
+                    summary.malformed_packets = summary.malformed_packets.saturating_add(1);
+                    continue;
+                };
+
+                let Some(remote_pubkey) = packet.meta().remote_pubkey() else {
+                    debug_assert!(false, "BLS packet missing remote pubkey");
+                    self.stats.num_malformed_pkts += 1;
+                    summary.malformed_packets = summary.malformed_packets.saturating_add(1);
+                    summary.missing_remote_pubkey = summary.missing_remote_pubkey.saturating_add(1);
+                    continue;
+                };
+
+                match msg {
+                    ConsensusMessage::Vote(vote) => {
+                        summary.raw_vote_messages = summary.raw_vote_messages.saturating_add(1);
+
+                        if let Some((pubkey, bls_pubkey)) = self.keep_vote(&vote, root_bank) {
+                            summary.kept_votes = summary.kept_votes.saturating_add(1);
+                            batch_has_kept_vote = true;
+
+                            #[cfg(feature = "dev-context-only-utils")]
+                            count_slot(&mut summary, vote.vote.slot());
+
+                            votes.push(VotePayload {
+                                vote_message: vote,
+                                bls_pubkey,
+                                pubkey,
+                                remote_pubkey,
+                                prepared_payload: None,
+                            });
+                        }
+                    }
+                    ConsensusMessage::Certificate(cert) => {
+                        summary.raw_cert_messages = summary.raw_cert_messages.saturating_add(1);
+
+                        if !cfg!(feature = "dev-context-only-utils")
+                            && cert.cert_type.slot() <= root_slot
+                        {
+                            self.stats.num_old_certs_received += 1;
+                            summary.old_certs = summary.old_certs.saturating_add(1);
+                            continue;
+                        }
+
+                        if self.generated_cert_types.has_cert(&cert.cert_type) {
+                            self.stats.num_generated_certs_received += 1;
+                            summary.generated_certs = summary.generated_certs.saturating_add(1);
+                            continue;
+                        }
+
+                        summary.kept_certs = summary.kept_certs.saturating_add(1);
+                        batch_has_kept_cert = true;
+
+                        #[cfg(feature = "dev-context-only-utils")]
+                        count_slot(&mut summary, cert.cert_type.slot());
+
+                        certs.push(CertPayload {
+                            cert,
                             remote_pubkey,
-                            prepared_payload: None,
                         });
                     }
                 }
-                ConsensusMessage::Certificate(cert) => {
-                    if !cfg!(feature = "dev-context-only-utils")
-                        && cert.cert_type.slot() <= root_slot
-                    {
-                        self.stats.num_old_certs_received += 1;
-                        continue;
-                    }
+            }
 
-                    if self.generated_cert_types.has_cert(&cert.cert_type) {
-                        self.stats.num_generated_certs_received += 1;
-                        continue;
-                    }
+            if batch_has_kept_vote {
+                summary.batches_with_kept_votes = summary.batches_with_kept_votes.saturating_add(1);
+            }
 
-                    certs.push(CertPayload {
-                        cert,
-                        remote_pubkey,
-                    });
-                }
+            if batch_has_kept_cert {
+                summary.batches_with_kept_certs = summary.batches_with_kept_certs.saturating_add(1);
+            }
+
+            if batch_has_kept_vote && batch_has_kept_cert {
+                summary.batches_with_kept_votes_and_certs =
+                    summary.batches_with_kept_votes_and_certs.saturating_add(1);
             }
         }
 
-        self.stats.num_pkts.add_sample(num_pkts);
-        (certs, votes)
+        self.stats.num_pkts.add_sample(summary.input_packets);
+
+        (certs, votes, summary)
     }
 
     /// If this vote should be verified, then returns the sender's Pubkey and BlsPubkey.
@@ -659,8 +674,6 @@ impl SigVerifier {
 
         let Some(rank_map) = root_bank.get_rank_map(vote.vote.slot()) else {
             self.stats.discard_vote_no_epoch_stakes += 1;
-            self.vote_debug.discard_no_epoch_stakes =
-                self.vote_debug.discard_no_epoch_stakes.saturating_add(1);
             return None;
         };
 
@@ -668,10 +681,9 @@ impl SigVerifier {
             .get_pubkey_stake_entry(vote.rank.into())
             .or_else(|| {
                 self.stats.discard_vote_invalid_rank += 1;
-                self.vote_debug.discard_invalid_rank =
-                    self.vote_debug.discard_invalid_rank.saturating_add(1);
                 None
             })?;
+
         let ret = Some((entry.vote_account_pubkey, entry.bls_pubkey));
 
         if cfg!(feature = "dev-context-only-utils") || vote.vote.slot() > root_slot {
@@ -684,25 +696,7 @@ impl SigVerifier {
         }
 
         self.stats.num_old_votes_received += 1;
-        self.vote_debug.discard_old_votes = self.vote_debug.discard_old_votes.saturating_add(1);
         None
-    }
-
-    fn print_vote_debug_summary(&self) {
-        eprintln!(
-            "[vote-summary] input_messages={}, kept_after_prefilter={}, \
-             discard_no_epoch_stakes={}, discard_invalid_rank={}, discard_old_votes={}, \
-             sent_to_sigverify={}, sig_verified={}, signature_failed={}, too_far_future={}",
-            self.vote_debug.input_messages,
-            self.vote_debug.kept_after_prefilter,
-            self.vote_debug.discard_no_epoch_stakes,
-            self.vote_debug.discard_invalid_rank,
-            self.vote_debug.discard_old_votes,
-            self.vote_debug.sent_to_sigverify,
-            self.vote_debug.sig_verified,
-            self.vote_debug.signature_failed,
-            self.vote_debug.too_far_future,
-        );
     }
 }
 

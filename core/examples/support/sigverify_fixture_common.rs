@@ -247,11 +247,8 @@ pub struct OutputRow {
     pub sigverify_avg_us_per_slot: f64,
     pub sigverify_max_us_per_slot: u64,
     pub sigverify_max_slot: u64,
-    pub sigverify_threads_needed_avg: f64,
-    pub sigverify_threads_needed_max: f64,
 
     pub elapsed_us: u64,
-    pub per_packet_us: u64,
 }
 
 pub struct TimedBatch {
@@ -645,7 +642,7 @@ pub fn build_stored_workload(ctx: &ExampleContext, config: &FixtureBuildConfig) 
                 let (message, remote_pubkey) =
                     build_vote_message_and_remote(ctx, slot, block_id, global_vote_index);
 
-                let arrival_us = slot_start_us + slot_rng.gen_range(0..SLOT_WINDOW_US);
+                let arrival_us = slot_start_us + slot_rng.random_range(0..SLOT_WINDOW_US);
 
                 slot_packets.push(consensus_message_to_stored_packet(
                     &message,
@@ -659,7 +656,7 @@ pub fn build_stored_workload(ctx: &ExampleContext, config: &FixtureBuildConfig) 
             for _ in 0..config.certs_per_slot {
                 let (message, remote_pubkey) = build_cert_message_and_remote(ctx, slot, block_id);
 
-                let arrival_us = slot_start_us + slot_rng.gen_range(0..SLOT_WINDOW_US);
+                let arrival_us = slot_start_us + slot_rng.random_range(0..SLOT_WINDOW_US);
 
                 slot_packets.push(consensus_message_to_stored_packet(
                     &message,
@@ -758,7 +755,7 @@ fn slot_rng_seed(seed: u64, slot_index: usize) -> u64 {
 }
 
 fn uniform_arrival_us(rng: &mut StdRng, slot_start_us: u64, slot_window_us: u64) -> u64 {
-    slot_start_us + rng.gen_range(0..slot_window_us)
+    slot_start_us + rng.random_range(0..slot_window_us)
 }
 
 fn burst_arrival_us(
@@ -768,10 +765,10 @@ fn burst_arrival_us(
     burst_centers: &[u64],
     burst_jitter_us: u64,
 ) -> u64 {
-    let center = burst_centers[rng.gen_range(0..burst_centers.len())];
+    let center = burst_centers[rng.random_range(0..burst_centers.len())];
 
     let jitter_span = burst_jitter_us.saturating_mul(2).saturating_add(1);
-    let jitter = rng.gen_range(0..jitter_span) as i64 - burst_jitter_us as i64;
+    let jitter = rng.random_range(0..jitter_span) as i64 - burst_jitter_us as i64;
 
     let arrival_offset =
         (center as i64 + jitter).clamp(0, slot_window_us.saturating_sub(1) as i64) as u64;
@@ -799,7 +796,7 @@ pub fn reshuffle_workload_for_replay(
             let mut rng = StdRng::seed_from_u64(slot_rng_seed(seed ^ 0xC347_B015, slot_index));
 
             (0..config.cert_bursts_per_slot)
-                .map(|_| rng.gen_range(0..workload.slot_window_us))
+                .map(|_| rng.random_range(0..workload.slot_window_us))
                 .collect()
         })
         .collect();

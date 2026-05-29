@@ -106,7 +106,7 @@ pub(super) fn verify_and_send_certificates(
 fn verify_certs(
     certs: Vec<CertPayload>,
     root_bank: &Bank,
-    seen_certs_set: &mut HashSet<CertificateType>,
+    _seen_certs_set: &mut HashSet<CertificateType>,
     stats: &mut SigVerifyCertStats,
     banlist: &SimpleQosBanlist,
     thread_pool: &ThreadPool,
