@@ -68,7 +68,7 @@ pub(super) fn verify_and_send_certificates(
         let cert_type = cert_payload.cert.cert_type;
 
         if !seen_certs_set.insert(cert_type) {
-            stats.unnecessary_certs_verified += 1;
+            stats.duplicate_certs_skipped_before_verify += 1;
             continue;
         }
 
@@ -106,7 +106,7 @@ pub(super) fn verify_and_send_certificates(
 fn verify_certs(
     certs: Vec<CertPayload>,
     root_bank: &Bank,
-    _seen_certs_set: &mut HashSet<CertificateType>,
+    seen_certs_set: &mut HashSet<CertificateType>,
     stats: &mut SigVerifyCertStats,
     banlist: &SimpleQosBanlist,
     thread_pool: &ThreadPool,
@@ -126,6 +126,8 @@ fn verify_certs(
         .filter_map(|(cert_payload, res)| match res {
             Ok(()) => Some(ConsensusMessage::Certificate(cert_payload.cert)),
             Err(e) => {
+                seen_certs_set.remove(&cert_payload.cert.cert_type);
+
                 match &e {
                     CertVerifyError::NotEnoughStake { .. }
                     | CertVerifyError::CertVerifyFailed(_) => {

@@ -97,6 +97,28 @@ pub struct VerifyBatchSummary {
     pub cert_reply_wait_us: u64,
     pub module_us: u64,
 
+    /// Cert-worker input queue length observed before sending this job.
+    ///
+    /// Replay can aggregate this as the input queue high-water mark.
+    pub cert_worker_input_queue_len_before_send: usize,
+
+    /// Configured cert-worker input queue capacity.
+    pub cert_worker_input_queue_capacity: usize,
+
+    /// Whether the cert-worker input queue was full before sending this job.
+    pub cert_worker_input_queue_was_full: bool,
+
+    /// Cert-worker reply queue length observed by the worker before sending this reply.
+    ///
+    /// Replay can aggregate this as the reply queue high-water mark.
+    pub cert_worker_reply_queue_len_before_send: usize,
+
+    /// Configured cert-worker reply queue capacity.
+    pub cert_worker_reply_queue_capacity: usize,
+
+    /// Whether the cert-worker reply queue was full before sending this reply.
+    pub cert_worker_reply_queue_was_full: bool,
+
     pub configured_vote_threads: usize,
 
     pub sig_verified_votes: u64,
@@ -107,7 +129,7 @@ pub struct VerifyBatchSummary {
     pub cert_signature_failed: u64,
     pub cert_stake_failed: u64,
     pub cert_too_far_future: u64,
-    pub cert_unnecessary: u64,
+    pub cert_duplicates_skipped_before_verify: u64,
 
     /// Timestamp captured immediately after vote verification finishes.
     ///
@@ -221,7 +243,24 @@ impl SigVerifierChannels {
     }
 }
 
-type CertJobResult = Result<SigVerifyCertStats, SigVerifyError>;
+type CertWorkerResult = Result<SigVerifyCertStats, SigVerifyError>;
+
+struct CertWorkerReply {
+    result: CertWorkerResult,
+    input_payloads: u64,
+    reply_queue_len_before_send: usize,
+    reply_queue_capacity: usize,
+    reply_queue_was_full: bool,
+}
+
+#[derive(Default)]
+struct CertDrainSummary {
+    input_payloads: u64,
+    cert_stats: SigVerifyCertStats,
+    reply_queue_len_before_send: usize,
+    reply_queue_capacity: usize,
+    reply_queue_was_full: bool,
+}
 
 struct CertJob {
     certs_to_verify: Vec<CertPayload>,
@@ -235,7 +274,7 @@ enum CertWorkerMsg {
 
 struct CertWorkerHandle {
     tx: Sender<CertWorkerMsg>,
-    reply_rx: Receiver<CertJobResult>,
+    reply_rx: Receiver<CertWorkerReply>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -244,6 +283,16 @@ impl CertWorkerHandle {
         let _ = self.tx.send(CertWorkerMsg::Shutdown);
 
         if let Some(join_handle) = self.join_handle.take() {
+            while !join_handle.is_finished() {
+                match self.reply_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(_) => {}
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            while self.reply_rx.try_recv().is_ok() {}
+
             let _ = join_handle.join();
         }
     }
@@ -254,7 +303,7 @@ fn spawn_cert_worker(
     channel_to_pool: Sender<Vec<ConsensusMessage>>,
 ) -> CertWorkerHandle {
     let (tx, rx) = bounded::<CertWorkerMsg>(CERT_WORKER_CHANNEL_CAPACITY);
-    let (reply_tx, reply_rx) = bounded::<CertJobResult>(CERT_WORKER_REPLY_CHANNEL_CAPACITY);
+    let (reply_tx, reply_rx) = bounded::<CertWorkerReply>(CERT_WORKER_REPLY_CHANNEL_CAPACITY);
 
     let join_handle = Builder::new()
         .name("solSigVerCert".to_string())
@@ -272,6 +321,7 @@ fn spawn_cert_worker(
                 match msg {
                     CertWorkerMsg::Job(job) => {
                         let root_slot = job.root_bank.slot();
+                        let input_payloads = job.certs_to_verify.len() as u64;
 
                         if last_checked_root_slot < root_slot {
                             last_checked_root_slot = root_slot;
@@ -288,7 +338,15 @@ fn spawn_cert_worker(
                         )
                         .map_err(SigVerifyError::from);
 
-                        if reply_tx.send(result).is_err() {
+                        let reply = CertWorkerReply {
+                            result,
+                            input_payloads,
+                            reply_queue_len_before_send: reply_tx.len(),
+                            reply_queue_capacity: reply_tx.capacity().unwrap_or(usize::MAX),
+                            reply_queue_was_full: reply_tx.is_full(),
+                        };
+
+                        if reply_tx.send(reply).is_err() {
                             break;
                         }
                     }
@@ -398,6 +456,14 @@ impl SigVerifier {
                 || (!cfg!(feature = "dev-context-only-utils")
                     && self.migration_status.is_pre_feature_activation())
             {
+                match self.drain_cert_worker_results() {
+                    Ok(cert_drain) => self.stats.cert_stats.merge(cert_drain.cert_stats),
+                    Err(e) => {
+                        error!("drain_cert_worker_results() failed with {e}. Exiting.");
+                        break;
+                    }
+                }
+
                 continue;
             }
 
@@ -450,15 +516,23 @@ impl SigVerifier {
             .extract_filter_msgs_us
             .add_sample(extract_filter_us);
 
-        let cert_worker_input_payloads = certs_to_verify.len() as u64;
+        let _cert_worker_input_payloads = certs_to_verify.len() as u64;
+        let cert_worker_input_queue_len_before_send = self.cert_worker.tx.len();
+        let cert_worker_input_queue_capacity = self.cert_worker.tx.capacity().unwrap_or(usize::MAX);
+        let cert_worker_input_queue_was_full = self.cert_worker.tx.is_full();
 
-        let (cert_worker_send_result, cert_worker_send_us) =
-            measure_us!(self.cert_worker.tx.send(CertWorkerMsg::Job(CertJob {
-                certs_to_verify,
-                root_bank: Arc::clone(&root_bank),
-            })));
+        let cert_worker_send_us = if certs_to_verify.is_empty() {
+            0
+        } else {
+            let (cert_worker_send_result, cert_worker_send_us) =
+                measure_us!(self.cert_worker.tx.send(CertWorkerMsg::Job(CertJob {
+                    certs_to_verify,
+                    root_bank: Arc::clone(&root_bank),
+                })));
 
-        cert_worker_send_result.map_err(|_| SigVerifyError::CertWorkerDisconnected)?;
+            cert_worker_send_result.map_err(|_| SigVerifyError::CertWorkerDisconnected)?;
+            cert_worker_send_us
+        };
 
         let (vote_result, vote_path_us) = measure_us!(verify_and_send_votes(
             votes_to_verify,
@@ -478,15 +552,21 @@ impl SigVerifier {
             .saturating_sub(vote_stats.too_far_in_future)
             .saturating_sub(vote_stats.sig_verified_votes);
 
-        let (cert_reply_result, cert_reply_wait_us) = measure_us!(self.cert_worker.reply_rx.recv());
+        let (cert_drain_result, cert_reply_wait_us) = measure_us!(self.drain_cert_worker_results());
 
-        let cert_stats =
-            cert_reply_result.map_err(|_| SigVerifyError::CertWorkerReplyDisconnected)??;
+        let cert_drain = cert_drain_result?;
+
+        let cert_worker_reply_queue_len_before_send = cert_drain.reply_queue_len_before_send;
+        let cert_worker_reply_queue_capacity = cert_drain.reply_queue_capacity;
+        let cert_worker_reply_queue_was_full = cert_drain.reply_queue_was_full;
+
+        let cert_stats = cert_drain.cert_stats;
 
         let module_us = module_start.elapsed().as_micros() as u64;
 
-        let certs_skipped_seen =
-            cert_worker_input_payloads.saturating_sub(cert_stats.certs_to_sig_verify);
+        let certs_skipped_seen = cert_drain
+            .input_payloads
+            .saturating_sub(cert_stats.certs_to_sig_verify);
 
         let summary = VerifyBatchSummary {
             root_slot,
@@ -520,6 +600,13 @@ impl SigVerifier {
             cert_reply_wait_us,
             module_us,
 
+            cert_worker_input_queue_len_before_send,
+            cert_worker_input_queue_capacity,
+            cert_worker_input_queue_was_full,
+            cert_worker_reply_queue_len_before_send,
+            cert_worker_reply_queue_capacity,
+            cert_worker_reply_queue_was_full,
+
             configured_vote_threads: self.thread_pool.current_num_threads(),
 
             sig_verified_votes: vote_stats.sig_verified_votes,
@@ -530,7 +617,7 @@ impl SigVerifier {
             cert_signature_failed: cert_stats.signature_verification_failed,
             cert_stake_failed: cert_stats.stake_verification_failed,
             cert_too_far_future: cert_stats.too_far_in_future,
-            cert_unnecessary: cert_stats.unnecessary_certs_verified,
+            cert_duplicates_skipped_before_verify: cert_stats.duplicate_certs_skipped_before_verify,
 
             vote_done_at,
 
@@ -542,6 +629,37 @@ impl SigVerifier {
         self.stats.cert_stats.merge(cert_stats);
 
         Ok(summary)
+    }
+
+    fn drain_cert_worker_results(&mut self) -> Result<CertDrainSummary, SigVerifyError> {
+        let mut drain = CertDrainSummary {
+            reply_queue_capacity: self.cert_worker.reply_rx.capacity().unwrap_or(usize::MAX),
+            ..CertDrainSummary::default()
+        };
+
+        loop {
+            match self.cert_worker.reply_rx.try_recv() {
+                Ok(cert_reply) => {
+                    drain.input_payloads = drain
+                        .input_payloads
+                        .saturating_add(cert_reply.input_payloads);
+                    drain.reply_queue_len_before_send = drain
+                        .reply_queue_len_before_send
+                        .max(cert_reply.reply_queue_len_before_send);
+                    drain.reply_queue_capacity = cert_reply.reply_queue_capacity;
+                    drain.reply_queue_was_full |= cert_reply.reply_queue_was_full;
+
+                    let cert_stats = cert_reply.result?;
+                    drain.cert_stats.merge(cert_stats);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(SigVerifyError::CertWorkerReplyDisconnected);
+                }
+            }
+        }
+
+        Ok(drain)
     }
 
     fn extract_and_filter_msgs(

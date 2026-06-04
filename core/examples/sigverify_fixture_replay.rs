@@ -183,6 +183,71 @@ fn main() {
         .expect("verifier thread panicked during replay");
 
     let summaries = summary_receiver.try_iter().collect::<Vec<_>>();
+
+    let cert_worker_input_queue_max_depth = summaries
+        .iter()
+        .map(|summary| summary.cert_worker_input_queue_len_before_send)
+        .max()
+        .unwrap_or_default();
+    let cert_worker_input_queue_capacity = summaries
+        .iter()
+        .map(|summary| summary.cert_worker_input_queue_capacity)
+        .max()
+        .unwrap_or_default();
+    let cert_worker_input_queue_full_count = summaries
+        .iter()
+        .filter(|summary| summary.cert_worker_input_queue_was_full)
+        .count();
+
+    let cert_worker_reply_queue_max_depth = summaries
+        .iter()
+        .map(|summary| summary.cert_worker_reply_queue_len_before_send)
+        .max()
+        .unwrap_or_default();
+    let cert_worker_reply_queue_capacity = summaries
+        .iter()
+        .map(|summary| summary.cert_worker_reply_queue_capacity)
+        .max()
+        .unwrap_or_default();
+    let cert_worker_reply_queue_full_count = summaries
+        .iter()
+        .filter(|summary| summary.cert_worker_reply_queue_was_full)
+        .count();
+
+    let cert_worker_send_max_us = summaries
+        .iter()
+        .map(|summary| summary.cert_worker_send_us)
+        .max()
+        .unwrap_or_default();
+    let cert_worker_send_total_us = summaries
+        .iter()
+        .map(|summary| summary.cert_worker_send_us)
+        .sum::<u64>();
+    let cert_reply_wait_max_us = summaries
+        .iter()
+        .map(|summary| summary.cert_reply_wait_us)
+        .max()
+        .unwrap_or_default();
+    let cert_reply_wait_total_us = summaries
+        .iter()
+        .map(|summary| summary.cert_reply_wait_us)
+        .sum::<u64>();
+
+    eprintln!(
+        "[cert-worker-queue] jobs={} input_max_depth={} input_capacity={} input_full_count={}          input_send_max_us={} input_send_total_us={} reply_max_depth={} reply_capacity={}          reply_full_count={} reply_wait_max_us={} reply_wait_total_us={}",
+        summaries.len(),
+        cert_worker_input_queue_max_depth,
+        cert_worker_input_queue_capacity,
+        cert_worker_input_queue_full_count,
+        cert_worker_send_max_us,
+        cert_worker_send_total_us,
+        cert_worker_reply_queue_max_depth,
+        cert_worker_reply_queue_capacity,
+        cert_worker_reply_queue_full_count,
+        cert_reply_wait_max_us,
+        cert_reply_wait_total_us,
+    );
+
     let elapsed_us = replay_start.elapsed().as_micros() as u64;
 
     let cert_ratio = if workload.total_packets == 0 {

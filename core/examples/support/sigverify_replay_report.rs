@@ -438,7 +438,7 @@ struct AggregatedVerifySummary {
     cert_signature_failed: u64,
     cert_stake_failed: u64,
     cert_too_far_future: u64,
-    cert_unnecessary: u64,
+    cert_duplicates_skipped_before_verify: u64,
 
     configured_vote_threads: usize,
 
@@ -552,9 +552,9 @@ impl AggregatedVerifySummary {
         self.cert_too_far_future = self
             .cert_too_far_future
             .saturating_add(summary.cert_too_far_future);
-        self.cert_unnecessary = self
-            .cert_unnecessary
-            .saturating_add(summary.cert_unnecessary);
+        self.cert_duplicates_skipped_before_verify = self
+            .cert_duplicates_skipped_before_verify
+            .saturating_add(summary.cert_duplicates_skipped_before_verify);
 
         self.configured_vote_threads = summary.configured_vote_threads;
 
@@ -714,8 +714,8 @@ impl Display for AggregatedVerifySummary {
         )?;
         writeln!(
             f,
-            "  unnecessary verified:        {}",
-            self.cert_unnecessary
+            "  duplicates skipped:        {}",
+            self.cert_duplicates_skipped_before_verify
         )?;
 
         writeln!(f, "Timing")?;
