@@ -76,6 +76,43 @@ pub(super) struct SigVerifierStats {
     last_report: Reporting,
 }
 
+/// Owned snapshot of the sigverifier's accounting counters, for the benchmark
+/// harness (which needs run totals rather than the periodically-reset,
+/// metrics-only counters). Plain `u64`s so it outlives the verifier.
+#[derive(Debug, Default, Clone)]
+pub struct SigVerifierStatsSnapshot {
+    pub num_discarded_pkts: u64,
+    pub num_malformed_pkts: u64,
+    pub discard_vote_invalid_rank: u64,
+    pub discard_vote_no_epoch_stakes: u64,
+    pub num_old_votes_received: u64,
+    pub num_old_certs_received: u64,
+    /// Certs dropped because another cert of the same `CertificateType` was
+    /// already verified (dedup) — the usual reason delivered < sent for certs.
+    pub num_verified_certs_received: u64,
+    pub num_generated_certs_received: u64,
+    pub votes_to_sig_verify: u64,
+    /// Vote groups (one per distinct payload) verified as a single aggregate via
+    /// the optimistic fast path.
+    pub vote_groups_optimistic_verified: u64,
+    /// Vote groups that failed the optimistic aggregate check and fell back to
+    /// per-vote verification.
+    pub vote_groups_fallback: u64,
+    /// Votes verified individually in the fallback path.
+    pub votes_individually_verified: u64,
+    /// Senders banlisted for an invalid vote signature.
+    pub votes_banned: u64,
+    pub votes_too_far_in_future: u64,
+    /// Vote aggregates sent to the pool — one per verified group, not per vote.
+    pub vote_aggregates_sent: u64,
+    pub certs_to_sig_verify: u64,
+    pub sig_verified_certs: u64,
+    pub unnecessary_certs_verified: u64,
+    pub certificate_verification_failed: u64,
+    pub certs_too_far_in_future: u64,
+    pub cert_pool_sent: u64,
+}
+
 impl SigVerifierStats {
     pub(super) fn new(root_slot: Slot) -> Self {
         Self {
@@ -96,6 +133,33 @@ impl SigVerifierStats {
             invalid_vote_banning_validator: Saturating(0),
             invalid_vote_already_banned: Saturating(0),
             last_report: Reporting::new(root_slot),
+        }
+    }
+
+    /// Owned snapshot of the current counter values for the benchmark harness.
+    pub(super) fn snapshot(&self) -> SigVerifierStatsSnapshot {
+        SigVerifierStatsSnapshot {
+            num_discarded_pkts: self.num_discarded_pkts.0,
+            num_malformed_pkts: self.num_malformed_pkts.0,
+            discard_vote_invalid_rank: self.discard_vote_invalid_rank.0,
+            discard_vote_no_epoch_stakes: self.discard_vote_no_epoch_stakes.0,
+            num_old_votes_received: self.num_old_votes_received.0,
+            num_old_certs_received: self.num_old_certs_received.0,
+            num_verified_certs_received: self.num_verified_certs_received.0,
+            num_generated_certs_received: self.num_generated_certs_received.0,
+            votes_to_sig_verify: self.vote_stats.votes_to_sig_verify.0,
+            vote_groups_optimistic_verified: self.vote_stats.optimistic_verification_succeeded.0,
+            vote_groups_fallback: self.vote_stats.optimistic_verification_failed.0,
+            votes_individually_verified: self.vote_stats.num_individual_verified.0,
+            votes_banned: self.vote_stats.banning_validator.0,
+            votes_too_far_in_future: self.vote_too_far_in_future.0,
+            vote_aggregates_sent: self.vote_stats.pool_sent.0,
+            certs_to_sig_verify: self.cert_stats.certs_to_sig_verify.0,
+            sig_verified_certs: self.cert_stats.sig_verified_certs.0,
+            unnecessary_certs_verified: self.cert_stats.unnecessary_certs_verified.0,
+            certificate_verification_failed: self.cert_stats.certificate_verification_failed.0,
+            certs_too_far_in_future: self.cert_stats.too_far_in_future.0,
+            cert_pool_sent: self.cert_stats.pool_sent.0,
         }
     }
 
