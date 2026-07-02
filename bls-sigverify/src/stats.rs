@@ -189,9 +189,8 @@ pub(super) struct SigVerifyCertStats {
     pub(super) certs_to_sig_verify: Saturating<u64>,
     /// Number of certs [`verify_and_send_certificates`] successfully verified the signature of.
     pub(super) sig_verified_certs: Saturating<u64>,
-    /// Number of certs that were verified unnecessarily because another cert of the same
-    /// `CertificateType` was already verified.
-    pub(super) unnecessary_certs_verified: Saturating<u64>,
+    /// Number of duplicate certs skipped before expensive signature verification.
+    pub(super) duplicate_certs_skipped_before_verify: Saturating<u64>,
     /// Number of times we are banning a validator that was already banned.
     pub(super) already_banned: Saturating<u64>,
 
@@ -216,7 +215,7 @@ impl SigVerifyCertStats {
         let Self {
             certs_to_sig_verify,
             sig_verified_certs,
-            unnecessary_certs_verified,
+            duplicate_certs_skipped_before_verify,
             already_banned,
             certificate_verification_failed,
             too_far_in_future,
@@ -225,9 +224,10 @@ impl SigVerifyCertStats {
             pool_channel_full,
             fn_verify_and_send_certs_stats,
         } = other;
+
         self.certs_to_sig_verify += certs_to_sig_verify;
         self.sig_verified_certs += sig_verified_certs;
-        self.unnecessary_certs_verified += unnecessary_certs_verified;
+        self.duplicate_certs_skipped_before_verify += duplicate_certs_skipped_before_verify;
         self.already_banned += already_banned;
         self.certificate_verification_failed += certificate_verification_failed;
         self.too_far_in_future += too_far_in_future;
@@ -242,7 +242,7 @@ impl SigVerifyCertStats {
         let Self {
             certs_to_sig_verify,
             sig_verified_certs,
-            unnecessary_certs_verified,
+            duplicate_certs_skipped_before_verify,
             already_banned,
             certificate_verification_failed,
             too_far_in_future,
@@ -257,8 +257,8 @@ impl SigVerifyCertStats {
             ("certs_to_sig_verify", certs_to_sig_verify.0, i64),
             ("sig_verified_certs", sig_verified_certs.0, i64),
             (
-                "unnecessary_certs_verified",
-                unnecessary_certs_verified.0,
+                "duplicate_certs_skipped_before_verify",
+                duplicate_certs_skipped_before_verify.0,
                 i64
             ),
             ("already_banned", already_banned.0, i64),
