@@ -147,6 +147,103 @@ pub struct VerifyBatchSummary {
     pub slot_message_counts: Vec<(Slot, u64)>,
 }
 
+
+#[derive(Debug, Default)]
+pub struct PerSlotTiming {
+    slot_us: Vec<(Slot, u64)>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PerSlotTimingSummary {
+    pub total_us: u64,
+    pub avg_us_per_slot: f64,
+    pub max_us_per_slot: u64,
+    pub max_slot: Slot,
+}
+
+impl PerSlotTiming {
+    pub fn new(base_slot: Slot, num_slots: usize) -> Self {
+        let slot_us = (0..num_slots)
+            .map(|slot_offset| (base_slot.saturating_add(slot_offset as Slot), 0))
+            .collect();
+
+        Self { slot_us }
+    }
+
+    fn add_slot_us(&mut self, slot: Slot, us: u64) {
+        if us == 0 {
+            return;
+        }
+
+        if let Some((_, total_us)) = self
+            .slot_us
+            .iter_mut()
+            .find(|(existing_slot, _)| *existing_slot == slot)
+        {
+            *total_us = total_us.saturating_add(us);
+            return;
+        }
+
+        self.slot_us.push((slot, us));
+    }
+
+    fn record_summary(&mut self, summary: &VerifyBatchSummary) {
+        #[cfg(feature = "dev-context-only-utils")]
+        {
+            let total_messages: u64 = summary
+                .slot_message_counts
+                .iter()
+                .map(|(_, count)| *count)
+                .sum();
+
+            if total_messages == 0 {
+                return;
+            }
+
+            let mut assigned_us = 0_u64;
+            let last_index = summary.slot_message_counts.len().saturating_sub(1);
+
+            for (index, (slot, count)) in summary.slot_message_counts.iter().enumerate() {
+                let slot_us = if index == last_index {
+                    summary.module_us.saturating_sub(assigned_us)
+                } else {
+                    summary.module_us.saturating_mul(*count) / total_messages
+                };
+
+                assigned_us = assigned_us.saturating_add(slot_us);
+                self.add_slot_us(*slot, slot_us);
+            }
+        }
+
+        #[cfg(not(feature = "dev-context-only-utils"))]
+        {
+            let _ = summary;
+        }
+    }
+
+    pub fn summary(&self) -> PerSlotTimingSummary {
+        if self.slot_us.is_empty() {
+            return PerSlotTimingSummary::default();
+        }
+
+        let total_us: u64 = self.slot_us.iter().map(|(_, us)| *us).sum();
+
+        let (max_slot, max_us_per_slot) = self
+            .slot_us
+            .iter()
+            .copied()
+            .max_by_key(|(_, us)| *us)
+            .unwrap_or_default();
+
+        PerSlotTimingSummary {
+            total_us,
+            avg_us_per_slot: total_us as f64 / self.slot_us.len() as f64,
+            max_us_per_slot,
+            max_slot,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct ExtractAndFilterSummary {
     received_batches: usize,
@@ -226,24 +323,6 @@ pub struct SigVerifierChannels {
     pub channel_to_reward: Sender<AddVoteMessage>,
     pub channel_to_pool: Sender<SigVerifiedBatch>,
     pub channel_to_metrics: ConsensusMetricsEventSender,
-}
-
-impl SigVerifierChannels {
-    pub fn new(
-        packet_receiver: Receiver<PacketBatch>,
-        channel_to_repair: VerifiedVoterSlotsSender,
-        channel_to_reward: Sender<AddVoteMessage>,
-        channel_to_pool: Sender<SigVerifiedBatch>,
-        channel_to_metrics: ConsensusMetricsEventSender,
-    ) -> Self {
-        Self {
-            packet_receiver,
-            channel_to_repair,
-            channel_to_reward,
-            channel_to_pool,
-            channel_to_metrics,
-        }
-    }
 }
 
 impl SigVerifierChannels {
@@ -448,7 +527,11 @@ impl SigVerifier {
     }
 
     pub fn run(self, exit: Arc<AtomicBool>) {
-        self.run_impl(exit, None);
+        self.run_impl(exit, None, None);
+    }
+
+    pub fn run_with_per_slot_timing(self, exit: Arc<AtomicBool>, timing: &mut PerSlotTiming) {
+        self.run_impl(exit, None, Some(timing));
     }
 
     /// Runs the verifier and emits one raw summary per verifier job.
@@ -457,13 +540,14 @@ impl SigVerifier {
     /// production pipeline; benchmark aggregation/reporting lives in examples.
     #[cfg(feature = "dev-context-only-utils")]
     pub fn run_for_replay(self, exit: Arc<AtomicBool>, summary_sender: Sender<VerifyBatchSummary>) {
-        self.run_impl(exit, Some(summary_sender));
+        self.run_impl(exit, Some(summary_sender), None);
     }
 
     fn run_impl(
         mut self,
         exit: Arc<AtomicBool>,
         summary_sender: Option<Sender<VerifyBatchSummary>>,
+        mut timing: Option<&mut PerSlotTiming>,
     ) {
         while !exit.load(Ordering::Relaxed) {
             const SOFT_RECEIVE_CAP: usize = 5000;
@@ -497,6 +581,10 @@ impl SigVerifier {
 
             match verify_res {
                 Ok(summary) => {
+                    if let Some(timing) = timing.as_deref_mut() {
+                        timing.record_summary(&summary);
+                    }
+
                     if let Some(summary_sender) = &summary_sender {
                         let _ = summary_sender.send(summary);
                     }
@@ -519,6 +607,17 @@ impl SigVerifier {
         batches: Vec<PacketBatch>,
     ) -> Result<(), SigVerifyError> {
         self.verify_and_send_batches_impl(batches).map(|_| ())
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn verify_and_send_batches_with_timing(
+        &mut self,
+        batches: Vec<PacketBatch>,
+        timing: &mut PerSlotTiming,
+    ) -> Result<(), SigVerifyError> {
+        let summary = self.verify_and_send_batches_impl(batches)?;
+        timing.record_summary(&summary);
+        Ok(())
     }
 
     fn verify_and_send_batches_impl(
@@ -570,8 +669,9 @@ impl SigVerifier {
 
         let vote_signature_failed = vote_stats
             .votes_to_sig_verify
-            .saturating_sub(vote_stats.too_far_in_future)
-            .saturating_sub(vote_stats.sig_verified_votes);
+            .0
+            .saturating_sub(vote_stats.too_far_in_future.0)
+            .saturating_sub(vote_stats.sig_verified_votes.0);
 
         let (cert_drain_result, cert_reply_wait_us) = measure_us!(self.drain_cert_worker_results());
 
@@ -587,7 +687,7 @@ impl SigVerifier {
 
         let certs_skipped_seen = cert_drain
             .input_payloads
-            .saturating_sub(cert_stats.certs_to_sig_verify);
+            .saturating_sub(cert_stats.certs_to_sig_verify.0);
 
         let summary = VerifyBatchSummary {
             root_slot,
@@ -606,7 +706,7 @@ impl SigVerifier {
 
             votes_to_verify: extract_summary.kept_votes,
             certs_to_verify: extract_summary.kept_certs,
-            certs_sent_to_sigverify: cert_stats.certs_to_sig_verify,
+            certs_sent_to_sigverify: cert_stats.certs_to_sig_verify.0,
             certs_skipped_seen,
 
             discarded_packets: extract_summary.discarded_packets,
@@ -630,15 +730,15 @@ impl SigVerifier {
 
             configured_vote_threads: self.thread_pool.current_num_threads(),
 
-            sig_verified_votes: vote_stats.sig_verified_votes,
+            sig_verified_votes: vote_stats.sig_verified_votes.0,
             vote_signature_failed,
-            vote_too_far_future: vote_stats.too_far_in_future,
+            vote_too_far_future: vote_stats.too_far_in_future.0,
 
-            cert_sig_verified: cert_stats.sig_verified_certs,
-            cert_signature_failed: cert_stats.signature_verification_failed,
-            cert_stake_failed: cert_stats.stake_verification_failed,
-            cert_too_far_future: cert_stats.too_far_in_future,
-            cert_duplicates_skipped_before_verify: cert_stats.duplicate_certs_skipped_before_verify,
+            cert_sig_verified: cert_stats.sig_verified_certs.0,
+            cert_signature_failed: cert_stats.certificate_verification_failed.0,
+            cert_stake_failed: 0,
+            cert_too_far_future: cert_stats.too_far_in_future.0,
+            cert_duplicates_skipped_before_verify: cert_stats.duplicate_certs_skipped_before_verify.0,
 
             vote_done_at,
 

@@ -6,21 +6,14 @@ extern crate clap4 as clap;
 #[path = "support/sigverify_fixture_common.rs"]
 mod sigverify_fixture_common;
 
-#[path = "support/sigverify_replay_report.rs"]
-mod sigverify_replay_report;
-
 use {
+    agave_bls_sigverify::bls_sigverifier::PerSlotTiming,
     clap::Parser,
-    crossbeam_channel::unbounded,
     sigverify_fixture_common::{
-        ExampleContext, OutputRow, ReplayConfig, fixture_max_slot, init_example_context,
-        load_workload_from_file, make_timed_batches, reshuffle_workload_for_replay,
-        validate_replay_config,
+        ExampleContext, OutputRow, ReplayConfig, debug_timed_batches, fixture_max_slot,
+        init_example_context, load_workload_from_file, make_timed_batches, print_results,
+        reshuffle_workload_for_replay, validate_replay_config,
     },
-    sigverify_replay_report::{
-        ReplayMetricsCollector, count_votes_in_batch, print_debug_send, print_debug_timed_batches,
-    },
-    solana_core::bls_sigverify::bls_sigverifier::VerifyBatchSummary,
     std::{
         sync::{
             Arc,
@@ -30,6 +23,8 @@ use {
         time::{Duration, Instant},
     },
 };
+
+const SEND_BLOCK_WARN_US: u64 = 100;
 
 fn wait_until(start: Instant, send_at_us: u64) {
     let target = start + Duration::from_micros(send_at_us);
@@ -51,6 +46,10 @@ fn wait_until(start: Instant, send_at_us: u64) {
     }
 }
 
+fn elapsed_us_since(start: Instant) -> u64 {
+    start.elapsed().as_micros() as u64
+}
+
 fn main() {
     let config = ReplayConfig::parse();
 
@@ -65,7 +64,6 @@ fn main() {
     });
 
     let workload = reshuffle_workload_for_replay(&workload, &config);
-
     let timed_batches = make_timed_batches(
         &workload,
         config.batch_window_us,
@@ -84,20 +82,31 @@ fn main() {
         .map(|timed_batch| timed_batch.send_at_us)
         .unwrap_or_default();
 
-    let timed_batches = timed_batches
-        .into_iter()
-        .map(|timed_batch| {
-            let vote_count = count_votes_in_batch(&timed_batch.batch);
-            (timed_batch, vote_count)
-        })
-        .collect::<Vec<_>>();
-    //if debug mode
-    print_debug_timed_batches(
-        &workload,
-        config.batch_window_us,
-        config.max_packets_per_batch,
-        config.debug_batches,
-    );
+    if config.debug_batches > 0 {
+        eprintln!(
+            "debug: first {} timed batches after replay reshuffle:",
+            config.debug_batches,
+        );
+
+        for batch in debug_timed_batches(
+            &workload,
+            config.batch_window_us,
+            config.max_packets_per_batch,
+            config.debug_batches,
+        ) {
+            eprintln!(
+                "debug batch #{:04}: send_at_us={}, packets={}, votes={}, certs={}, \
+                 first_arrival_us={}, last_arrival_us={}",
+                batch.index,
+                batch.send_at_us,
+                batch.packet_count,
+                batch.vote_count,
+                batch.cert_count,
+                batch.first_arrival_us,
+                batch.last_arrival_us,
+            );
+        }
+    }
 
     eprintln!(
         "Prepare phase is over; Start paced replay (arrival_pattern={:?}, emitted_batches={}, \
@@ -128,47 +137,58 @@ fn main() {
     let exit = Arc::new(AtomicBool::new(false));
     let verifier_exit = Arc::clone(&exit);
 
-    let (summary_sender, summary_receiver) = unbounded::<VerifyBatchSummary>();
+    let timing = PerSlotTiming::new(workload.base_slot, workload.num_slots);
 
     let verifier_thread = thread::Builder::new()
         .name("sigverify-fixture-replay".to_string())
-        .spawn(move || verifier.run_for_replay(verifier_exit, summary_sender))
+        .spawn(move || {
+            let mut timing = timing;
+            verifier.run_with_per_slot_timing(verifier_exit, &mut timing);
+            timing
+        })
         .expect("failed to spawn verifier thread");
 
     let replay_start = Instant::now();
-    let mut collector = ReplayMetricsCollector::new(scheduled_end_us);
 
-    for (index, (timed_batch, vote_count)) in timed_batches.into_iter().enumerate() {
-        let scheduled_send_at_us = timed_batch.send_at_us;
+    let mut max_schedule_lag_us = 0u64;
+    let mut max_send_block_us = 0u64;
+    let mut total_send_block_us = 0u64;
+    let mut blocked_sends_over_100us = 0u64;
+    let mut actual_send_end_us = 0u64;
 
-        wait_until(replay_start, scheduled_send_at_us);
+    for (index, timed_batch) in timed_batches.into_iter().enumerate() {
+        wait_until(replay_start, timed_batch.send_at_us);
 
-        let before_send_us = replay_start.elapsed().as_micros() as u64;
-        let schedule_lag_us = before_send_us.saturating_sub(scheduled_send_at_us);
-
-        collector.record_pending_batch(index as u64, vote_count);
+        let before_send_us = elapsed_us_since(replay_start);
+        let schedule_lag_us = before_send_us.saturating_sub(timed_batch.send_at_us);
 
         let send_start = Instant::now();
-
         packet_sender
             .send(timed_batch.batch)
             .expect("packet receiver disconnected");
-
         let send_block_us = send_start.elapsed().as_micros() as u64;
-        let actual_send_end_us = replay_start.elapsed().as_micros() as u64;
 
-        collector.record_send_result(schedule_lag_us, send_block_us, actual_send_end_us);
+        actual_send_end_us = elapsed_us_since(replay_start);
+        max_schedule_lag_us = max_schedule_lag_us.max(schedule_lag_us);
+        max_send_block_us = max_send_block_us.max(send_block_us);
+        total_send_block_us = total_send_block_us.saturating_add(send_block_us);
 
-        print_debug_send(
-            index,
-            config.debug_batches,
-            scheduled_send_at_us,
-            before_send_us,
-            actual_send_end_us,
-            schedule_lag_us,
-            send_block_us,
-            vote_count,
-        );
+        if send_block_us > SEND_BLOCK_WARN_US {
+            blocked_sends_over_100us = blocked_sends_over_100us.saturating_add(1);
+        }
+
+        if index < config.debug_batches {
+            eprintln!(
+                "debug send #{:04}: scheduled_send_at_us={}, before_send_us={}, \
+                 actual_send_end_us={}, schedule_lag_us={}, send_block_us={}",
+                index,
+                timed_batch.send_at_us,
+                before_send_us,
+                actual_send_end_us,
+                schedule_lag_us,
+                send_block_us,
+            );
+        }
     }
 
     while packet_sender.len() > 0 {
@@ -178,77 +198,26 @@ fn main() {
     exit.store(true, Ordering::Relaxed);
     drop(packet_sender);
 
-    verifier_thread
+    let timing = verifier_thread
         .join()
         .expect("verifier thread panicked during replay");
 
-    let summaries = summary_receiver.try_iter().collect::<Vec<_>>();
+    let timing_summary = timing.summary();
 
-    let cert_worker_input_queue_max_depth = summaries
-        .iter()
-        .map(|summary| summary.cert_worker_input_queue_len_before_send)
-        .max()
-        .unwrap_or_default();
-    let cert_worker_input_queue_capacity = summaries
-        .iter()
-        .map(|summary| summary.cert_worker_input_queue_capacity)
-        .max()
-        .unwrap_or_default();
-    let cert_worker_input_queue_full_count = summaries
-        .iter()
-        .filter(|summary| summary.cert_worker_input_queue_was_full)
-        .count();
-
-    let cert_worker_reply_queue_max_depth = summaries
-        .iter()
-        .map(|summary| summary.cert_worker_reply_queue_len_before_send)
-        .max()
-        .unwrap_or_default();
-    let cert_worker_reply_queue_capacity = summaries
-        .iter()
-        .map(|summary| summary.cert_worker_reply_queue_capacity)
-        .max()
-        .unwrap_or_default();
-    let cert_worker_reply_queue_full_count = summaries
-        .iter()
-        .filter(|summary| summary.cert_worker_reply_queue_was_full)
-        .count();
-
-    let cert_worker_send_max_us = summaries
-        .iter()
-        .map(|summary| summary.cert_worker_send_us)
-        .max()
-        .unwrap_or_default();
-    let cert_worker_send_total_us = summaries
-        .iter()
-        .map(|summary| summary.cert_worker_send_us)
-        .sum::<u64>();
-    let cert_reply_wait_max_us = summaries
-        .iter()
-        .map(|summary| summary.cert_reply_wait_us)
-        .max()
-        .unwrap_or_default();
-    let cert_reply_wait_total_us = summaries
-        .iter()
-        .map(|summary| summary.cert_reply_wait_us)
-        .sum::<u64>();
+    let elapsed_us = elapsed_us_since(replay_start);
 
     eprintln!(
-        "[cert-worker-queue] jobs={} input_max_depth={} input_capacity={} input_full_count={}          input_send_max_us={} input_send_total_us={} reply_max_depth={} reply_capacity={}          reply_full_count={} reply_wait_max_us={} reply_wait_total_us={}",
-        summaries.len(),
-        cert_worker_input_queue_max_depth,
-        cert_worker_input_queue_capacity,
-        cert_worker_input_queue_full_count,
-        cert_worker_send_max_us,
-        cert_worker_send_total_us,
-        cert_worker_reply_queue_max_depth,
-        cert_worker_reply_queue_capacity,
-        cert_worker_reply_queue_full_count,
-        cert_reply_wait_max_us,
-        cert_reply_wait_total_us,
+        "send schedule: scheduled_end_us={}, actual_send_end_us={}, send_lag_us={}, \
+         max_schedule_lag_us={}, max_send_block_us={}, total_send_block_us={}, \
+         blocked_sends_over_100us={}",
+        scheduled_end_us,
+        actual_send_end_us,
+        actual_send_end_us.saturating_sub(scheduled_end_us),
+        max_schedule_lag_us,
+        max_send_block_us,
+        total_send_block_us,
+        blocked_sends_over_100us,
     );
-
-    let elapsed_us = replay_start.elapsed().as_micros() as u64;
 
     let cert_ratio = if workload.total_packets == 0 {
         0.0
@@ -262,39 +231,55 @@ fn main() {
         workload.vote_packets as f64 / workload.total_packets as f64
     };
 
-    let report = collector.build_report(
-        &summaries,
-        workload.base_slot,
-        workload.num_slots,
-        OutputRow {
-            seed: workload.seed,
-            arrival_pattern: config.arrival_pattern,
-            batch_window_us: config.batch_window_us,
-            max_packets_per_batch: config.max_packets_per_batch,
-            emitted_batches,
-            avg_packets_per_batch,
-            num_slots: workload.num_slots,
-            votes_per_slot: workload.votes_per_slot,
-            certs_per_slot: workload.certs_per_slot,
-            base_slot: workload.base_slot,
-            slot_window_us: workload.slot_window_us,
-            cert_signers: workload.cert_signers,
-            cert_ratio,
-            vote_ratio,
-            num_threads: config.num_threads,
-            num_validators: workload.num_validators,
-            total_packets: workload.total_packets,
-            vote_packets: workload.vote_packets,
-            cert_packets: workload.cert_packets,
+    let per_packet_us = if workload.total_packets == 0 {
+        0
+    } else {
+        elapsed_us / workload.total_packets as u64
+    };
 
-            sigverify_total_us: 0,
-            sigverify_avg_us_per_slot: 0.0,
-            sigverify_max_us_per_slot: 0,
-            sigverify_max_slot: workload.base_slot,
+    let sigverify_threads_needed_avg = if workload.slot_window_us == 0 {
+        0.0
+    } else {
+        timing_summary.avg_us_per_slot / workload.slot_window_us as f64
+    };
 
-            elapsed_us,
-        },
-    );
+    let sigverify_threads_needed_max = if workload.slot_window_us == 0 {
+        0.0
+    } else {
+        timing_summary.max_us_per_slot as f64 / workload.slot_window_us as f64
+    };
 
-    print!("{report}");
+    let row = OutputRow {
+        seed: workload.seed,
+        arrival_pattern: config.arrival_pattern,
+        batch_window_us: config.batch_window_us,
+        max_packets_per_batch: config.max_packets_per_batch,
+        emitted_batches,
+        avg_packets_per_batch,
+        num_slots: workload.num_slots,
+        votes_per_slot: workload.votes_per_slot,
+        certs_per_slot: workload.certs_per_slot,
+        base_slot: workload.base_slot,
+        slot_window_us: workload.slot_window_us,
+        cert_signers: workload.cert_signers,
+        cert_ratio,
+        vote_ratio,
+        num_threads: config.num_threads,
+        num_validators: workload.num_validators,
+        total_packets: workload.total_packets,
+        vote_packets: workload.vote_packets,
+        cert_packets: workload.cert_packets,
+
+        sigverify_total_us: timing_summary.total_us,
+        sigverify_avg_us_per_slot: timing_summary.avg_us_per_slot,
+        sigverify_max_us_per_slot: timing_summary.max_us_per_slot,
+        sigverify_max_slot: timing_summary.max_slot,
+        sigverify_threads_needed_avg,
+        sigverify_threads_needed_max,
+
+        elapsed_us,
+        per_packet_us,
+    };
+
+    print_results(&row, config.csv);
 }

@@ -5,26 +5,27 @@
 extern crate clap4 as clap;
 
 use {
-    agave_votor::{
-        consensus_metrics::ConsensusMetricsEvent,
-        consensus_pool::certificate_builder::CertificateBuilder,
+    agave_bls_sigverify::{
+        bls_sigverifier::{SigVerifier, SigVerifierChannels, SigVerifierContext},
         generated_cert_types::GeneratedCertTypes,
+        sig_verified_messages::SigVerifiedBatch,
     },
+    agave_votor::consensus_pool::certificate_builder::CertificateBuilder,
     agave_votor_messages::{
-        consensus_message::{Certificate, CertificateType, ConsensusMessage, VoteMessage},
+        VerifiedVoterSlotsReceiver,
+        certificate::{Certificate, CertificateType},
+        consensus_message::{Block, ConsensusMessage, VoteMessage},
+        metric_types::ConsensusMetricsEvent,
         migration::MigrationStatus,
         reward_certificate::AddVoteMessage,
         vote::Vote,
+        wire::{VersionedWireConsensusMessage, VotePayloadToSign},
     },
     clap::{Parser, ValueEnum},
     crossbeam_channel::{Receiver, Sender, bounded},
     rand::{Rng, RngCore, SeedableRng, rngs::StdRng},
     rayon::prelude::*,
     solana_bls_signatures::Signature as BLSSignature,
-    solana_core::{
-        bls_sigverify::bls_sigverifier::{SigVerifier, SigVerifierChannels, SigVerifierContext},
-        cluster_info_vote_listener::VerifiedVoterSlotsReceiver,
-    },
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_hash::Hash,
     solana_keypair::{Keypair, Signer},
@@ -54,6 +55,7 @@ pub const CERT_SIGNERS: usize = 1500;
 
 // Synthetic slot duration used only for assigning packet arrival times.
 pub const SLOT_WINDOW_US: u64 = 200_000;
+pub const FIXTURE_SHRED_VERSION: u16 = 0;
 
 #[derive(Debug, Clone, Parser)]
 pub struct FixtureBuildConfig {
@@ -247,8 +249,11 @@ pub struct OutputRow {
     pub sigverify_avg_us_per_slot: f64,
     pub sigverify_max_us_per_slot: u64,
     pub sigverify_max_slot: u64,
+    pub sigverify_threads_needed_avg: f64,
+    pub sigverify_threads_needed_max: f64,
 
     pub elapsed_us: u64,
+    pub per_packet_us: u64,
 }
 
 pub struct TimedBatch {
@@ -274,7 +279,7 @@ pub struct ExampleContext {
     pub validator_ranks: Vec<u16>,
     pub _repair_receiver: VerifiedVoterSlotsReceiver,
     pub _reward_receiver: Receiver<AddVoteMessage>,
-    pub _pool_receiver: Receiver<Vec<ConsensusMessage>>,
+    pub _pool_receiver: Receiver<SigVerifiedBatch>,
     pub _metrics_receiver: Receiver<(std::time::Instant, Vec<ConsensusMetricsEvent>)>,
 }
 
@@ -502,7 +507,8 @@ pub fn create_signed_vote_message(
     validator_index: usize,
 ) -> VoteMessage {
     let bls_keypair = &validator_keypairs[validator_index].bls_keypair;
-    let payload = wincode::serialize(&vote).expect("failed to serialize vote");
+    let payload_to_sign = VotePayloadToSign::new_from_vote(vote, FIXTURE_SHRED_VERSION);
+    let payload = wincode::serialize(&payload_to_sign).expect("failed to serialize vote payload");
     let signature: BLSSignature = bls_keypair.sign(&payload).into();
 
     VoteMessage {
@@ -547,8 +553,10 @@ pub fn build_vote_message_and_remote(
     let validator = &ctx.validator_keypairs[validator_index];
     let rank = ctx.validator_ranks[validator_index];
 
-    let vote = Vote::new_notarization_vote(slot, block_id);
-    let payload = wincode::serialize(&vote).expect("failed to serialize vote");
+    let block = Block { slot, block_id };
+    let vote = Vote::new_notarization_vote(block);
+    let payload_to_sign = VotePayloadToSign::new_from_vote(vote, FIXTURE_SHRED_VERSION);
+    let payload = wincode::serialize(&payload_to_sign).expect("failed to serialize vote payload");
     let signature = validator.bls_keypair.sign(&payload).into();
 
     let vote_msg = VoteMessage {
@@ -568,7 +576,8 @@ pub fn build_cert_message_and_remote(
     slot: u64,
     block_id: Hash,
 ) -> (ConsensusMessage, Pubkey) {
-    let cert_type = CertificateType::Notarize(slot, block_id);
+    let block = Block { slot, block_id };
+    let cert_type = CertificateType::Notarize(block);
 
     let validator_indices: Vec<usize> = (0..CERT_SIGNERS).collect();
     let cert = create_signed_certificate_message(
@@ -591,7 +600,15 @@ pub fn consensus_message_to_stored_packet(
     slot_index: usize,
     arrival_us: u64,
 ) -> StoredPacket {
-    let message_bytes = bincode::serialize(message).expect("failed to serialize message");
+    let wire_message = VersionedWireConsensusMessage::new(message.clone(), FIXTURE_SHRED_VERSION);
+    let mut message_bytes = Vec::new();
+
+    wincode::config::serialize_into(
+        &mut message_bytes,
+        &wire_message,
+        solana_perf::packet::packet_config(),
+    )
+    .expect("failed to serialize wire consensus message");
 
     StoredPacket {
         message_bytes,
@@ -642,7 +659,7 @@ pub fn build_stored_workload(ctx: &ExampleContext, config: &FixtureBuildConfig) 
                 let (message, remote_pubkey) =
                     build_vote_message_and_remote(ctx, slot, block_id, global_vote_index);
 
-                let arrival_us = slot_start_us + slot_rng.random_range(0..SLOT_WINDOW_US);
+                let arrival_us = slot_start_us + slot_rng.gen_range(0..SLOT_WINDOW_US);
 
                 slot_packets.push(consensus_message_to_stored_packet(
                     &message,
@@ -656,7 +673,7 @@ pub fn build_stored_workload(ctx: &ExampleContext, config: &FixtureBuildConfig) 
             for _ in 0..config.certs_per_slot {
                 let (message, remote_pubkey) = build_cert_message_and_remote(ctx, slot, block_id);
 
-                let arrival_us = slot_start_us + slot_rng.random_range(0..SLOT_WINDOW_US);
+                let arrival_us = slot_start_us + slot_rng.gen_range(0..SLOT_WINDOW_US);
 
                 slot_packets.push(consensus_message_to_stored_packet(
                     &message,
@@ -755,7 +772,7 @@ fn slot_rng_seed(seed: u64, slot_index: usize) -> u64 {
 }
 
 fn uniform_arrival_us(rng: &mut StdRng, slot_start_us: u64, slot_window_us: u64) -> u64 {
-    slot_start_us + rng.random_range(0..slot_window_us)
+    slot_start_us + rng.gen_range(0..slot_window_us)
 }
 
 fn burst_arrival_us(
@@ -765,10 +782,10 @@ fn burst_arrival_us(
     burst_centers: &[u64],
     burst_jitter_us: u64,
 ) -> u64 {
-    let center = burst_centers[rng.random_range(0..burst_centers.len())];
+    let center = burst_centers[rng.gen_range(0..burst_centers.len())];
 
     let jitter_span = burst_jitter_us.saturating_mul(2).saturating_add(1);
-    let jitter = rng.random_range(0..jitter_span) as i64 - burst_jitter_us as i64;
+    let jitter = rng.gen_range(0..jitter_span) as i64 - burst_jitter_us as i64;
 
     let arrival_offset =
         (center as i64 + jitter).clamp(0, slot_window_us.saturating_sub(1) as i64) as u64;
@@ -796,7 +813,7 @@ pub fn reshuffle_workload_for_replay(
             let mut rng = StdRng::seed_from_u64(slot_rng_seed(seed ^ 0xC347_B015, slot_index));
 
             (0..config.cert_bursts_per_slot)
-                .map(|_| rng.random_range(0..workload.slot_window_us))
+                .map(|_| rng.gen_range(0..workload.slot_window_us))
                 .collect()
         })
         .collect();
