@@ -13,6 +13,7 @@ use {
     },
     crossbeam_channel::{Receiver, Sender, bounded},
     rand::{RngCore, SeedableRng, rngs::StdRng},
+    solana_epoch_schedule::EpochSchedule,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_keypair::{Keypair, Signer},
     solana_ledger::leader_schedule_cache::LeaderScheduleCache,
@@ -124,23 +125,33 @@ pub fn init_example_context(
     );
     // Root the fork one slot below the workload window so every synthetic vote and
     // certificate carries a slot strictly greater than the root and is admissible on
-    // the real verifier path. The window fits inside a single epoch, so the root
-    // bank's epoch stakes still cover every slot in base_slot..=max_slot.
+    // the real verifier path.
     assert!(
         base_slot >= 2,
         "base_slot must be >= 2 so the fork can root at base_slot - 1 >= 1"
     );
     let root_slot = base_slot - 1;
+    // Pin a single large, no-warmup epoch so the whole workload window lands in epoch 0.
+    // The root bank (below the window) then still carries epoch stakes for every workload
+    // slot; with the default warmup schedule a multi-hundred-slot window would cross into
+    // epochs the root bank has no stakes for, and `get_rank_map` would fail mid-window.
+    let epoch_schedule = EpochSchedule::without_warmup();
+    assert!(
+        max_slot < epoch_schedule.slots_per_epoch,
+        "workload window must fit inside epoch 0 (max_slot={max_slot}, slots_per_epoch={})",
+        epoch_schedule.slots_per_epoch,
+    );
 
     let validator_keypairs = make_deterministic_validator_vote_keypairs(seed, num_validators);
 
     let stakes: Vec<_> = (0..validator_keypairs.len()).map(|_| 1_000_u64).collect();
 
-    let genesis = create_genesis_config_with_alpenglow_vote_accounts(
+    let mut genesis = create_genesis_config_with_alpenglow_vote_accounts(
         1_000_000_000,
         &validator_keypairs,
         stakes,
     );
+    genesis.genesis_config.epoch_schedule = epoch_schedule;
 
     let bank0 = Bank::new_for_tests(&genesis.genesis_config);
     let (bank0, _temp_bank_forks) = bank0.wrap_with_bank_forks_for_tests();
