@@ -14,8 +14,8 @@ use {
         leader_schedule_cache::LeaderScheduleCache,
         shred::{
             self,
-            layout::{get_shred, get_shred_mut, set_retransmitter_signature},
-            wire::is_retransmitter_signed_variant,
+            layout::get_shred,
+            wire::{is_retransmitter_signed_variant, resign_packet},
         },
         sigverify_shreds::{LruCache, SlotPubkeys, verify_shred_cpu},
     },
@@ -25,7 +25,6 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
-    solana_signature::Signature,
     solana_signer::Signer,
     solana_streamer::{evicting_sender::EvictingSender, streamer::ChannelSend},
     std::{
@@ -75,40 +74,6 @@ enum ResignError {
 
 pub type RepairNonceLocationLookup = dyn Fn(shred::Nonce) -> Option<BlockLocation> + Send + Sync;
 
-#[derive(Clone, Copy)]
-struct PacketLocation {
-    batch_index: usize,
-    packet_index: usize,
-}
-
-struct VerifyJob {
-    batches: Arc<Vec<PacketBatch>>,
-    locations: Arc<Vec<PacketLocation>>,
-    range: std::ops::Range<usize>,
-    slot_leaders: Arc<SlotPubkeys>,
-}
-
-struct VerifyResult {
-    invalid_locations: Vec<PacketLocation>,
-}
-
-struct ResignJob {
-    batches: Arc<Vec<PacketBatch>>,
-    locations: Arc<Vec<PacketLocation>>,
-    range: std::ops::Range<usize>,
-    root_bank: Arc<Bank>,
-    working_bank: Arc<Bank>,
-    keypair: Arc<Keypair>,
-}
-
-enum ResignAction {
-    Discard(PacketLocation),
-    SetSignature {
-        location: PacketLocation,
-        signature: Signature,
-    },
-}
-
 #[derive(Default)]
 struct ResignWorkerStats {
     num_invalid_retransmitter: usize,
@@ -118,30 +83,65 @@ struct ResignWorkerStats {
     num_unknown_turbine_parent: usize,
 }
 
-struct ResignResult {
-    actions: Vec<ResignAction>,
-    stats: ResignWorkerStats,
+impl ResignWorkerStats {
+    fn accumulate(&mut self, other: Self) {
+        self.num_invalid_retransmitter += other.num_invalid_retransmitter;
+        self.num_retranmitter_signature_skipped += other.num_retranmitter_signature_skipped;
+        self.num_retranmitter_signature_verified += other.num_retranmitter_signature_verified;
+        self.num_unknown_slot_leader += other.num_unknown_slot_leader;
+        self.num_unknown_turbine_parent += other.num_unknown_turbine_parent;
+    }
+
+    fn commit(self, stats: &ShredSigVerifyStats) {
+        stats
+            .num_invalid_retransmitter
+            .fetch_add(self.num_invalid_retransmitter, Ordering::Relaxed);
+
+        stats
+            .num_retranmitter_signature_skipped
+            .fetch_add(self.num_retranmitter_signature_skipped, Ordering::Relaxed);
+
+        stats
+            .num_retranmitter_signature_verified
+            .fetch_add(self.num_retranmitter_signature_verified, Ordering::Relaxed);
+
+        stats
+            .num_unknown_slot_leader
+            .fetch_add(self.num_unknown_slot_leader, Ordering::Relaxed);
+
+        stats
+            .num_unknown_turbine_parent
+            .fetch_add(self.num_unknown_turbine_parent, Ordering::Relaxed);
+    }
 }
 
-enum VerifyWorkerMessage {
-    Verify(VerifyJob),
-    Resign(ResignJob),
-    Shutdown,
+struct ResignContext {
+    root_bank: Arc<Bank>,
+    working_bank: Arc<Bank>,
+    keypair: Arc<Keypair>,
 }
 
-enum VerifyWorkerResult {
-    Verify(VerifyResult),
-    Resign(ResignResult),
+#[derive(Clone)]
+enum BatchOperation {
+    Verify(Arc<SlotPubkeys>),
+    Resign(Arc<ResignContext>),
 }
 
-struct VerifyWorker {
-    job_sender: Sender<VerifyWorkerMessage>,
-    result_receiver: Receiver<VerifyWorkerResult>,
-    handle: Option<JoinHandle<()>>,
+struct BatchJob {
+    batch_index: usize,
+    batch: PacketBatch,
+    operation: BatchOperation,
+}
+
+struct BatchResult {
+    batch_index: usize,
+    batch: PacketBatch,
+    resign_stats: ResignWorkerStats,
 }
 
 struct ShredSigverifyWorkers {
-    workers: Vec<VerifyWorker>,
+    job_sender: Sender<BatchJob>,
+    result_receiver: Receiver<BatchResult>,
 }
 
 impl ShredSigverifyWorkers {
@@ -152,129 +152,144 @@ impl ShredSigverifyWorkers {
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         cluster_nodes_cache: Arc<ClusterNodesCache<RetransmitStage>>,
     ) -> Self {
-        let workers = (0..num_workers.get())
-            .map(|index| {
-                let (job_sender, job_receiver) = bounded::<VerifyWorkerMessage>(1);
-                let (result_sender, result_receiver) = bounded::<VerifyWorkerResult>(1);
+        let (job_sender, job_receiver) =
+            bounded::<BatchJob>(SIGVERIFY_SHRED_BATCH_SIZE);
 
-                let cache = cache.clone();
-                let cluster_info = cluster_info.clone();
-                let leader_schedule_cache = leader_schedule_cache.clone();
-                let cluster_nodes_cache = cluster_nodes_cache.clone();
+        let (result_sender, result_receiver) =
+            bounded::<BatchResult>(SIGVERIFY_SHRED_BATCH_SIZE);
 
-                let handle = Builder::new()
-                    .name(format!("solSvrfyShred{index:02}"))
-                    .spawn(move || {
-                        while let Ok(message) = job_receiver.recv() {
-                            let result = match message {
-                                VerifyWorkerMessage::Verify(job) => {
-                                    let VerifyJob {
-                                        batches,
-                                        locations,
-                                        range,
-                                        slot_leaders,
-                                    } = job;
+        for index in 0..num_workers.get() {
+            let job_receiver = job_receiver.clone();
+            let result_sender = result_sender.clone();
 
-                                    let mut invalid_locations = Vec::new();
+            let cache = cache.clone();
+            let cluster_info = cluster_info.clone();
+            let leader_schedule_cache = leader_schedule_cache.clone();
+            let cluster_nodes_cache = cluster_nodes_cache.clone();
 
-                                    for &location in &locations[range] {
-                                        let packet = batches[location.batch_index]
-                                            .get(location.packet_index)
-                                            .expect(
-                                                "packet location must reference an existing packet",
-                                            );
+            Builder::new()
+                .name(format!("solSvrfyShred{index:02}"))
+                .spawn(move || {
+                    while let Ok(job) = job_receiver.recv() {
+                        let BatchJob {
+                            batch_index,
+                            mut batch,
+                            operation,
+                        } = job;
 
-                                        if !verify_shred_cpu(
-                                            packet,
-                                            slot_leaders.as_ref(),
-                                            cache.as_ref(),
-                                        ) {
-                                            invalid_locations.push(location);
-                                        }
+                        let mut resign_stats = ResignWorkerStats::default();
+
+                        match operation {
+                            BatchOperation::Verify(slot_leaders) => {
+                                for mut packet in batch.iter_mut() {
+                                    if packet.meta().discard() {
+                                        continue;
                                     }
 
-                                    VerifyWorkerResult::Verify(VerifyResult { invalid_locations })
+                                    if !verify_shred_cpu(
+                                        packet.as_ref(),
+                                        slot_leaders.as_ref(),
+                                        cache.as_ref(),
+                                    ) {
+                                        packet.meta_mut().set_discard(true);
+                                    }
                                 }
+                            }
 
-                                VerifyWorkerMessage::Resign(job) => {
-                                    let ResignJob {
-                                        batches,
-                                        locations,
-                                        range,
-                                        root_bank,
-                                        working_bank,
-                                        keypair,
-                                    } = job;
-
-                                    let mut actions = Vec::new();
-                                    let mut stats = ResignWorkerStats::default();
-
-                                    for &location in &locations[range] {
-                                        let packet = batches[location.batch_index]
-                                            .get(location.packet_index)
-                                            .expect(
-                                                "packet location must reference an existing packet",
-                                            );
-
-                                        match maybe_verify_and_prepare_resign(
-                                            packet,
-                                            root_bank.as_ref(),
-                                            working_bank.as_ref(),
-                                            cluster_info.as_ref(),
-                                            leader_schedule_cache.as_ref(),
-                                            cluster_nodes_cache.as_ref(),
-                                            &mut stats,
-                                            keypair.as_ref(),
-                                        ) {
-                                            Ok(Some(signature)) => {
-                                                actions.push(ResignAction::SetSignature {
-                                                    location,
-                                                    signature,
-                                                });
-                                            }
-                                            Ok(None) => {}
-                                            Err(_) => {
-                                                actions.push(ResignAction::Discard(location));
-                                            }
-                                        }
+                            BatchOperation::Resign(context) => {
+                                for mut packet in batch.iter_mut() {
+                                    if packet.meta().discard() {
+                                        continue;
                                     }
 
-                                    VerifyWorkerResult::Resign(ResignResult { actions, stats })
+                                    if maybe_verify_and_resign_packet(
+                                        &mut packet,
+                                        context.root_bank.as_ref(),
+                                        context.working_bank.as_ref(),
+                                        cluster_info.as_ref(),
+                                        leader_schedule_cache.as_ref(),
+                                        cluster_nodes_cache.as_ref(),
+                                        &mut resign_stats,
+                                        context.keypair.as_ref(),
+                                    )
+                                    .is_err()
+                                    {
+                                        packet.meta_mut().set_discard(true);
+                                    }
                                 }
-
-                                VerifyWorkerMessage::Shutdown => break,
-                            };
-
-                            if result_sender.send(result).is_err() {
-                                break;
                             }
                         }
-                    })
-                    .unwrap();
 
-                VerifyWorker {
-                    job_sender,
-                    result_receiver,
-                    handle: Some(handle),
-                }
-            })
+                        if result_sender
+                            .send(BatchResult {
+                                batch_index,
+                                batch,
+                                resign_stats,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .unwrap();
+        }
+
+        Self {
+            job_sender,
+            result_receiver,
+        }
+    }
+
+    fn process_batches(
+        &self,
+        packets: &mut Vec<PacketBatch>,
+        operation: BatchOperation,
+    ) -> ResignWorkerStats {
+        if packets.is_empty() {
+            return ResignWorkerStats::default();
+        }
+        assert!(packets.len() <= SIGVERIFY_SHRED_BATCH_SIZE);
+        let num_batches = packets.len();
+
+        let mut completed = std::iter::repeat_with(|| None)
+            .take(num_batches)
+            .collect::<Vec<Option<PacketBatch>>>();
+
+        let mut resign_stats = ResignWorkerStats::default();
+
+        for (batch_index, batch) in std::mem::take(packets).into_iter().enumerate() {
+            self.job_sender
+                .send(BatchJob {
+                    batch_index,
+                    batch,
+                    operation: operation.clone(),
+                })
+                .expect("shred sigverify workers must be alive");
+        }
+
+        for _ in 0..num_batches {
+            let BatchResult {
+                batch_index,
+                batch,
+                resign_stats: worker_stats,
+            } = self
+                .result_receiver
+                .recv()
+                .expect("shred sigverify worker must return a result");
+
+            debug_assert!(completed[batch_index].is_none());
+
+            completed[batch_index] = Some(batch);
+            resign_stats.accumulate(worker_stats);
+        }
+
+        *packets = completed
+            .into_iter()
+            .map(|batch| batch.expect("every packet batch must be returned"))
             .collect();
 
-        Self { workers }
-    }
-}
-
-impl Drop for ShredSigverifyWorkers {
-    fn drop(&mut self) {
-        for worker in &self.workers {
-            let _ = worker.job_sender.send(VerifyWorkerMessage::Shutdown);
-        }
-
-        for worker in &mut self.workers {
-            if let Some(handle) = worker.handle.take() {
-                let _ = handle.join();
-            }
-        }
+        resign_stats
     }
 }
 
@@ -422,9 +437,8 @@ fn run_shred_sigverify<const K: usize>(
 
     stats.num_discards_post += count_discards(shred_buffer);
 
-    // Verify retransmitter signatures and calculate new retransmitter
-    // signatures in the persistent worker threads. The coordinator applies
-    // the resulting mutations after all workers complete.
+    // Verify retransmitter signatures and resign packets in-place in the
+    // persistent worker threads.
     let resign_start = Instant::now();
 
     resign_packets(
@@ -510,8 +524,8 @@ fn extract_shred_and_location(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn maybe_verify_and_prepare_resign(
-    packet: PacketRef,
+fn maybe_verify_and_resign_packet(
+    packet: &mut PacketRefMut,
     root_bank: &Bank,
     working_bank: &Bank,
     cluster_info: &ClusterInfo,
@@ -519,14 +533,16 @@ fn maybe_verify_and_prepare_resign(
     cluster_nodes_cache: &ClusterNodesCache<RetransmitStage>,
     stats: &mut ResignWorkerStats,
     keypair: &Keypair,
-) -> Result<Option<Signature>, ResignError> {
+) -> Result<(), ResignError> {
     let repair = packet.meta().repair();
-    let shred = get_shred(packet).ok_or(shred::Error::InvalidPacketSize)?;
+    let shred = get_shred(packet.as_ref()).ok_or(shred::Error::InvalidPacketSize)?;
 
     if !is_retransmitter_signed_variant(shred)? {
-        return Ok(None);
+        return Ok(());
     }
 
+    // Repair packets do not follow the turbine tree and are verified
+    // using the trailing repair nonce.
     if !repair
         && !verify_retransmitter_signature(
             shred,
@@ -554,10 +570,9 @@ fn maybe_verify_and_prepare_resign(
         }
     }
 
-    let merkle_root =
-        shred::layout::get_merkle_root(shred).ok_or(shred::Error::InvalidMerkleRoot)?;
+    resign_packet(packet, keypair)?;
 
-    Ok(Some(keypair.sign_message(merkle_root.as_ref())))
+    Ok(())
 }
 
 #[must_use]
@@ -614,30 +629,6 @@ fn verify_retransmitter_signature(
     }
 }
 
-fn apply_retransmitter_signature(
-    packet: &mut PacketRefMut,
-    signature: &Signature,
-) -> Result<(), shred::Error> {
-    match packet {
-        PacketRefMut::Packet(packet) => {
-            let shred =
-                get_shred_mut(packet.buffer_mut()).ok_or(shred::Error::InvalidPacketSize)?;
-
-            set_retransmitter_signature(shred, signature)
-        }
-        PacketRefMut::Bytes(packet) => {
-            let mut buffer = packet.buffer().to_vec();
-
-            let shred = get_shred_mut(&mut buffer).ok_or(shred::Error::InvalidPacketSize)?;
-
-            set_retransmitter_signature(shred, signature)?;
-
-            packet.set_buffer(buffer);
-
-            Ok(())
-        }
-    }
-}
 fn resign_packets(
     workers: &ShredSigverifyWorkers,
     packets: &mut Vec<PacketBatch>,
@@ -646,120 +637,15 @@ fn resign_packets(
     keypair: Arc<Keypair>,
     stats: &ShredSigVerifyStats,
 ) {
-    let locations = Arc::new(
-        packets
-            .iter()
-            .enumerate()
-            .flat_map(|(batch_index, batch)| {
-                batch
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, packet)| !packet.meta().discard())
-                    .map(move |(packet_index, _)| PacketLocation {
-                        batch_index,
-                        packet_index,
-                    })
-            })
-            .collect::<Vec<_>>(),
-    );
+    let context = Arc::new(ResignContext {
+        root_bank,
+        working_bank,
+        keypair,
+    });
 
-    if locations.is_empty() {
-        return;
-    }
+    let worker_stats = workers.process_batches(packets, BatchOperation::Resign(context));
 
-    let num_workers = workers.workers.len().min(locations.len());
-    let base_work = locations.len() / num_workers;
-    let extra_work = locations.len() % num_workers;
-
-    let shared_batches = Arc::new(std::mem::take(packets));
-
-    let mut start = 0;
-
-    for (worker_index, worker) in workers.workers.iter().take(num_workers).enumerate() {
-        let work_len = base_work + usize::from(worker_index < extra_work);
-        let end = start + work_len;
-
-        worker
-            .job_sender
-            .send(VerifyWorkerMessage::Resign(ResignJob {
-                batches: shared_batches.clone(),
-                locations: locations.clone(),
-                range: start..end,
-                root_bank: root_bank.clone(),
-                working_bank: working_bank.clone(),
-                keypair: keypair.clone(),
-            }))
-            .expect("shred sigverify worker must be alive");
-
-        start = end;
-    }
-
-    debug_assert_eq!(start, locations.len());
-
-    let mut actions = Vec::new();
-
-    for worker in workers.workers.iter().take(num_workers) {
-        let VerifyWorkerResult::Resign(result) = worker
-            .result_receiver
-            .recv()
-            .expect("shred sigverify worker must return a result")
-        else {
-            unreachable!("sigverify worker returned unexpected result");
-        };
-
-        stats
-            .num_invalid_retransmitter
-            .fetch_add(result.stats.num_invalid_retransmitter, Ordering::Relaxed);
-
-        stats.num_retranmitter_signature_skipped.fetch_add(
-            result.stats.num_retranmitter_signature_skipped,
-            Ordering::Relaxed,
-        );
-
-        stats.num_retranmitter_signature_verified.fetch_add(
-            result.stats.num_retranmitter_signature_verified,
-            Ordering::Relaxed,
-        );
-
-        stats
-            .num_unknown_slot_leader
-            .fetch_add(result.stats.num_unknown_slot_leader, Ordering::Relaxed);
-
-        stats
-            .num_unknown_turbine_parent
-            .fetch_add(result.stats.num_unknown_turbine_parent, Ordering::Relaxed);
-
-        actions.extend(result.actions);
-    }
-
-    let mut batches = Arc::try_unwrap(shared_batches)
-        .expect("shred sigverify workers must release packet batches");
-
-    for action in actions {
-        match action {
-            ResignAction::Discard(location) => {
-                let mut packet = batches[location.batch_index]
-                    .get_mut(location.packet_index)
-                    .expect("packet location must reference an existing packet");
-
-                packet.meta_mut().set_discard(true);
-            }
-            ResignAction::SetSignature {
-                location,
-                signature,
-            } => {
-                let mut packet = batches[location.batch_index]
-                    .get_mut(location.packet_index)
-                    .expect("packet location must reference an existing packet");
-
-                if apply_retransmitter_signature(&mut packet, &signature).is_err() {
-                    packet.meta_mut().set_discard(true);
-                }
-            }
-        }
-    }
-
-    *packets = batches;
+    worker_stats.commit(stats);
 }
 
 fn verify_packets(
@@ -776,80 +662,7 @@ fn verify_packets(
             .collect::<SlotPubkeys>(),
     );
 
-    let locations = Arc::new(
-        packets
-            .iter()
-            .enumerate()
-            .flat_map(|(batch_index, batch)| {
-                batch
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, packet)| !packet.meta().discard())
-                    .map(move |(packet_index, _)| PacketLocation {
-                        batch_index,
-                        packet_index,
-                    })
-            })
-            .collect::<Vec<_>>(),
-    );
-
-    if locations.is_empty() {
-        return;
-    }
-
-    let num_workers = workers.workers.len().min(locations.len());
-    let base_work = locations.len() / num_workers;
-    let extra_work = locations.len() % num_workers;
-
-    let shared_batches = Arc::new(std::mem::take(packets));
-
-    let mut start = 0;
-
-    for (worker_index, worker) in workers.workers.iter().take(num_workers).enumerate() {
-        let work_len = base_work + usize::from(worker_index < extra_work);
-        let end = start + work_len;
-
-        worker
-            .job_sender
-            .send(VerifyWorkerMessage::Verify(VerifyJob {
-                batches: shared_batches.clone(),
-                locations: locations.clone(),
-                range: start..end,
-                slot_leaders: leader_slots.clone(),
-            }))
-            .expect("shred sigverify worker must be alive");
-
-        start = end;
-    }
-
-    debug_assert_eq!(start, locations.len());
-
-    let mut invalid_locations = Vec::new();
-
-    for worker in workers.workers.iter().take(num_workers) {
-        let VerifyWorkerResult::Verify(result) = worker
-            .result_receiver
-            .recv()
-            .expect("shred sigverify worker must return a result")
-        else {
-            unreachable!("sigverify worker returned unexpected result");
-        };
-
-        invalid_locations.extend(result.invalid_locations);
-    }
-
-    let mut batches = Arc::try_unwrap(shared_batches)
-        .expect("shred sigverify workers must release packet batches");
-
-    for location in invalid_locations {
-        let mut packet = batches[location.batch_index]
-            .get_mut(location.packet_index)
-            .expect("packet location must reference an existing packet");
-
-        packet.meta_mut().set_discard(true);
-    }
-
-    *packets = batches;
+    workers.process_batches(packets, BatchOperation::Verify(leader_slots));
 }
 
 // Returns pubkey of leaders for shred slots referenced in the packets.
