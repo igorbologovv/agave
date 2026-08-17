@@ -1,7 +1,11 @@
 #![allow(clippy::arithmetic_side_effects)]
 
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 use {
-    crossbeam_channel::unbounded,
+    crossbeam_channel::bounded,
     solana_entry::entry::create_ticks,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_hash::Hash,
@@ -32,11 +36,15 @@ use {
     },
 };
 
-const SHREDS_PER_SECOND: usize = 6_250;
 const SHREDS_PER_SLOT: usize = 2_500;
+const SLOT_DURATION: Duration = Duration::from_millis(400);
+
 const PACKETS_PER_BATCH: usize = 64;
+const CHANNEL_CAPACITY: usize = 1_024;
+
 const DEFAULT_NUM_SLOTS: usize = 50;
 const DEFAULT_NUM_SIGVERIFY_THREADS: usize = 4;
+
 const FIRST_SLOT: u64 = 1;
 
 /// Optional control channel for `perf stat`.
@@ -92,23 +100,23 @@ impl PerfControl {
     }
 
     fn command(&mut self, command: &str) {
-    let Some(control) = self.control.as_mut() else {
-        return;
-    };
+        let Some(control) = self.control.as_mut() else {
+            return;
+        };
 
-    writeln!(control, "{command}").expect("write perf control command");
-    control.flush().expect("flush perf control command");
+        writeln!(control, "{command}").expect("write perf control command");
+        control.flush().expect("flush perf control command");
 
-    if let Some(ack) = self.ack.as_mut() {
-        let mut response = String::new();
-        ack.read_line(&mut response).expect("read perf ack");
+        if let Some(ack) = self.ack.as_mut() {
+            let mut response = String::new();
+            ack.read_line(&mut response).expect("read perf ack");
 
-        assert_eq!(
-            response.trim_matches(|c: char| c == '\0' || c.is_whitespace()),
-            "ack"
-        );
+            assert_eq!(
+                response.trim_matches(|c: char| c == '\0' || c.is_whitespace()),
+                "ack"
+            );
+        }
     }
-}
 
     fn enable(&mut self) {
         self.command("enable");
@@ -148,17 +156,10 @@ fn make_slot_batches(
 
     let entries = create_ticks(num_ticks, 0, Hash::new_unique());
 
-    let shredder = Shredder::new(
-        slot,
-        slot.saturating_sub(1),
-        0,
-        0,
-    )
-    .unwrap();
+    let shredder = Shredder::new(slot, slot.saturating_sub(1), 0, 0).unwrap();
 
-    // `false` deliberately avoids turning the benchmark into a
-    // retransmitter-resigning benchmark. The first workload is intended
-    // to measure the normal shred verification path.
+    // Avoid turning the benchmark into a retransmitter-resigning benchmark.
+    // This workload measures the normal shred verification path.
     let (data_shreds, coding_shreds) = shredder.entries_to_merkle_shreds_for_tests(
         leader_keypair,
         &entries,
@@ -196,10 +197,7 @@ fn make_slot_batches(
         .collect()
 }
 
-fn make_workload(
-    leader_keypair: &Keypair,
-    num_slots: usize,
-) -> Vec<PacketBatch> {
+fn make_workload(leader_keypair: &Keypair, num_slots: usize) -> Vec<PacketBatch> {
     let batches_per_slot = SHREDS_PER_SLOT.div_ceil(PACKETS_PER_BATCH);
 
     let mut workload = Vec::with_capacity(num_slots * batches_per_slot);
@@ -207,19 +205,23 @@ fn make_workload(
     for slot_offset in 0..num_slots {
         let slot = FIRST_SLOT + slot_offset as u64;
 
-        workload.extend(make_slot_batches(
-            leader_keypair,
-            slot,
-            SHREDS_PER_SLOT,
-        ));
+        workload.extend(make_slot_batches(leader_keypair, slot, SHREDS_PER_SLOT));
     }
 
     workload
 }
 
+/// Returns the target arrival time for `num_shreds` from the start of replay.
+///
+/// The rate is derived from the workload model:
+///
+///     2_500 shreds / 400 ms
+///     = 6_250 shreds / second
+///
+/// Keeping slot duration and shreds-per-slot as the source of truth avoids
+/// maintaining a separate, potentially inconsistent shreds-per-second value.
 fn arrival_offset(num_shreds: usize) -> Duration {
-    let nanos = num_shreds as u128 * 1_000_000_000u128
-        / SHREDS_PER_SECOND as u128;
+    let nanos = num_shreds as u128 * SLOT_DURATION.as_nanos() / SHREDS_PER_SLOT as u128;
 
     Duration::from_nanos(nanos as u64)
 }
@@ -237,10 +239,7 @@ fn sleep_until(deadline: Instant) {
 }
 
 fn main() {
-    let num_slots = env_usize(
-        "SHRED_SIGVERIFY_SLOTS",
-        DEFAULT_NUM_SLOTS,
-    );
+    let num_slots = env_usize("SHRED_SIGVERIFY_SLOTS", DEFAULT_NUM_SLOTS);
 
     let num_sigverify_threads = NonZeroUsize::new(env_usize(
         "SHRED_SIGVERIFY_THREADS",
@@ -253,18 +252,16 @@ fn main() {
     let leader_keypair = Arc::new(Keypair::new());
     let leader_pubkey = leader_keypair.pubkey();
 
-    // The validator running sigverify must not be the leader. get_slot_leaders()
-    // intentionally rejects shreds produced by the validator itself.
+    // The validator running sigverify must not be the leader.
+    // get_slot_leaders() intentionally rejects shreds produced by the
+    // validator itself.
     let node_keypair = Arc::new(Keypair::new());
     let node_pubkey = node_keypair.pubkey();
 
     //
     // Prepare the complete workload before starting perf counters.
     //
-    let workload = make_workload(
-        leader_keypair.as_ref(),
-        num_slots,
-    );
+    let workload = make_workload(leader_keypair.as_ref(), num_slots);
 
     let expected_shreds = num_slots * SHREDS_PER_SLOT;
 
@@ -274,55 +271,52 @@ fn main() {
     );
 
     let bank = Bank::new_for_tests(
-        &create_genesis_config_with_leader(
-            100,
-            &leader_pubkey,
-            10,
-        )
-        .genesis_config,
+        &create_genesis_config_with_leader(100, &leader_pubkey, 10).genesis_config,
     );
 
-    let leader_schedule_cache =
-        Arc::new(LeaderScheduleCache::new_from_bank(&bank));
+    let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
 
     let bank_forks = BankForks::new_rw_arc(bank);
 
     let cluster_info = Arc::new(ClusterInfo::new(
-        ContactInfo::new_localhost(
-            &node_pubkey,
-            timestamp(),
-        ),
+        ContactInfo::new_localhost(&node_pubkey, timestamp()),
         node_keypair,
         SocketAddrSpace::Unspecified,
     ));
 
     //
-    // An unbounded ingress channel is intentional here.
+    // Use bounded channels so the benchmark models finite pipeline capacity
+    // rather than allowing an unlimited backlog.
     //
-    // The pacing producer must never be blocked by the harness itself.
-    // If sigverify cannot sustain the requested rate, the queue is allowed
-    // to accumulate rather than modifying the arrival schedule.
-    //
-    let (shred_fetch_sender, shred_fetch_receiver) =
-        unbounded::<PacketBatch>();
+    let (shred_fetch_sender, shred_fetch_receiver) = bounded::<PacketBatch>(CHANNEL_CAPACITY);
 
     //
-    // We are benchmarking shred sigverify, not retransmit stage consumption.
-    // EvictingSender keeps this output non-blocking, as in production.
+    // Retransmit output is intentionally tiny and evicting because retransmit
+    // consumption itself is outside the scope of this benchmark.
     //
-    let (retransmit_sender, _retransmit_receiver) =
-        EvictingSender::new_bounded(1);
+    let (retransmit_sender, _retransmit_receiver) = EvictingSender::new_bounded(1);
 
     //
-    // TVU also uses an unbounded verified-shred channel.
-    // We deliberately drain it only after perf counters are disabled so
-    // receiver-side benchmark bookkeeping is not included in CPU measurements.
+    // Window-service output is bounded and actively drained while sigverify
+    // runs. Otherwise a bounded receiver would eventually fill and block
+    // sigverify for reasons unrelated to verification performance.
     //
-    let (verified_sender, verified_receiver) = unbounded();
+    let (verified_sender, verified_receiver) = bounded::<
+        Vec<(
+            solana_ledger::shred::Payload,
+            bool,
+            solana_ledger::blockstore_meta::BlockLocation,
+        )>,
+    >(CHANNEL_CAPACITY);
 
-    let repair_nonce_location_lookup:
-        Arc<RepairNonceLocationLookup> =
-        Arc::new(|_| None);
+    let verified_handle = thread::spawn(move || {
+        verified_receiver
+            .into_iter()
+            .map(|shreds| shreds.len())
+            .sum::<usize>()
+    });
+
+    let repair_nonce_location_lookup: Arc<RepairNonceLocationLookup> = Arc::new(|_| None);
 
     //
     // Worker creation is outside the measured section.
@@ -349,8 +343,7 @@ fn main() {
     let mut sent_shreds = 0usize;
 
     for batch in workload {
-        let deadline =
-            replay_start + arrival_offset(sent_shreds);
+        let deadline = replay_start + arrival_offset(sent_shreds);
 
         sleep_until(deadline);
 
@@ -376,22 +369,23 @@ fn main() {
         .expect("shred sigverify thread panicked");
 
     //
-    // Measurement ends only after all queued shred verification work
-    // has completed, so tail-drain CPU is included.
+    // The sigverify sender is gone after the stage exits, so the verified
+    // consumer drains the remaining output and terminates.
+    //
+    let verified_shreds = verified_handle
+        .join()
+        .expect("verified shred consumer panicked");
+
+    //
+    // Measurement ends only after the complete measured pipeline has drained.
     //
     perf.disable();
 
     //
-    // Validation happens outside the measured region.
+    // Validation itself happens outside the measured region.
     //
-    let verified_shreds = verified_receiver
-        .try_iter()
-        .map(|shreds| shreds.len())
-        .sum::<usize>();
-
     assert_eq!(
-        verified_shreds,
-        expected_shreds,
+        verified_shreds, expected_shreds,
         "some shreds did not survive sigverify",
     );
 }
