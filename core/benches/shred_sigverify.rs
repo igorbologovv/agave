@@ -14,9 +14,9 @@ use {
     genesis_utils::create_genesis_config_with_leader,
     leader_schedule_cache::LeaderScheduleCache,
     shred::{
-        DATA_SHREDS_PER_FEC_BLOCK, ProcessShredsStats, ReedSolomonCache, Shredder,
-        get_data_shred_bytes_per_batch_typical, max_ticks_per_n_shreds,
-    },
+    self, DATA_SHREDS_PER_FEC_BLOCK, ProcessShredsStats, ReedSolomonCache, ShredId,
+    Shredder, get_data_shred_bytes_per_batch_typical, max_ticks_per_n_shreds,
+},
     sigverify_shreds::{
         reset_sigverify_debug_counters,
         sigverify_debug_counters,
@@ -30,6 +30,7 @@ use {
     solana_time_utils::timestamp,
     solana_turbine::sigverify_shreds::{RepairNonceLocationLookup, spawn_shred_sigverify},
     std::{
+        collections::HashSet,
         env,
         fs::{File, OpenOptions},
         io::{BufRead, BufReader, Write},
@@ -171,7 +172,11 @@ fn make_slot_batches(
     slot: u64,
     batches_per_slot: usize,
     invalid_packets_per_slot: usize,
-) -> Vec<PacketBatch> {
+) -> (
+    Vec<PacketBatch>,
+    HashSet<ShredId>,
+    HashSet<ShredId>,
+) {
     let shreds_per_slot = batches_per_slot * PACKETS_PER_BATCH;
     let shred_size = shred_size_typical();
 
@@ -207,6 +212,11 @@ fn make_slot_batches(
     shreds.truncate(shreds_per_slot);
 
     let mut batches = Vec::with_capacity(batches_per_slot);
+    let mut expected_valid_ids =
+        HashSet::<ShredId>::with_capacity(shreds_per_slot - invalid_packets_per_slot);
+    let mut expected_invalid_ids =
+        HashSet::<ShredId>::with_capacity(invalid_packets_per_slot);
+    let mut seen_ids = HashSet::<ShredId>::with_capacity(shreds_per_slot);
     let mut corrupted_packets = 0usize;
 
     for (batch_index, shreds) in shreds.chunks(PACKETS_PER_BATCH).enumerate() {
@@ -214,6 +224,13 @@ fn make_slot_batches(
 
         for (packet_index, shred) in shreds.iter().enumerate() {
             let slot_packet_index = batch_index * PACKETS_PER_BATCH + packet_index;
+            let shred_id = shred.id();
+
+            assert!(
+                seen_ids.insert(shred_id),
+                "workload contains duplicate shred id: {shred_id:?}"
+            );
+
             let mut packet = shred.payload().to_packet(None);
 
             if should_corrupt_packet(
@@ -221,8 +238,17 @@ fn make_slot_batches(
                 shreds_per_slot,
                 invalid_packets_per_slot,
             ) {
+                assert!(
+                    expected_invalid_ids.insert(shred_id),
+                    "duplicate intentionally invalid shred id: {shred_id:?}"
+                );
                 corrupt_shred_signature(&mut packet);
                 corrupted_packets += 1;
+            } else {
+                assert!(
+                    expected_valid_ids.insert(shred_id),
+                    "duplicate expected-valid shred id: {shred_id:?}"
+                );
             }
 
             batch.push(packet);
@@ -233,8 +259,18 @@ fn make_slot_batches(
 
     assert_eq!(batches.len(), batches_per_slot);
     assert_eq!(corrupted_packets, invalid_packets_per_slot);
+    assert_eq!(seen_ids.len(), shreds_per_slot);
+    assert_eq!(
+        expected_valid_ids.len(),
+        shreds_per_slot - invalid_packets_per_slot
+    );
+    assert_eq!(expected_invalid_ids.len(), invalid_packets_per_slot);
 
-    batches
+    (
+        batches,
+        expected_valid_ids,
+        expected_invalid_ids,
+    )
 }
 
 fn make_workload(
@@ -242,21 +278,66 @@ fn make_workload(
     num_slots: usize,
     batches_per_slot: usize,
     invalid_packets_per_slot: usize,
-) -> Vec<PacketBatch> {
+) -> (
+    Vec<PacketBatch>,
+    HashSet<ShredId>,
+    HashSet<ShredId>,
+) {
     let mut workload = Vec::with_capacity(num_slots * batches_per_slot);
+
+    let expected_valid_capacity =
+        num_slots * (batches_per_slot * PACKETS_PER_BATCH - invalid_packets_per_slot);
+    let expected_invalid_capacity = num_slots * invalid_packets_per_slot;
+
+    let mut expected_valid_ids =
+        HashSet::<ShredId>::with_capacity(expected_valid_capacity);
+    let mut expected_invalid_ids =
+        HashSet::<ShredId>::with_capacity(expected_invalid_capacity);
 
     for slot_offset in 0..num_slots {
         let slot = FIRST_SLOT + slot_offset as u64;
 
-        workload.extend(make_slot_batches(
+        let (
+            slot_batches,
+            slot_expected_valid_ids,
+            slot_expected_invalid_ids,
+        ) = make_slot_batches(
             leader_keypair,
             slot,
             batches_per_slot,
             invalid_packets_per_slot,
-        ));
+        );
+
+        workload.extend(slot_batches);
+
+        for shred_id in slot_expected_valid_ids {
+            assert!(
+                !expected_invalid_ids.contains(&shred_id),
+                "shred id appears as both valid and invalid: {shred_id:?}"
+            );
+            assert!(
+                expected_valid_ids.insert(shred_id),
+                "duplicate valid shred id across workload: {shred_id:?}"
+            );
+        }
+
+        for shred_id in slot_expected_invalid_ids {
+            assert!(
+                !expected_valid_ids.contains(&shred_id),
+                "shred id appears as both valid and invalid: {shred_id:?}"
+            );
+            assert!(
+                expected_invalid_ids.insert(shred_id),
+                "duplicate invalid shred id across workload: {shred_id:?}"
+            );
+        }
     }
 
-    workload
+    (
+        workload,
+        expected_valid_ids,
+        expected_invalid_ids,
+    )
 }
 
 /// Returns the target arrival time for `num_shreds` from the start of replay.
@@ -335,8 +416,13 @@ fn main() {
     let node_keypair = Arc::new(Keypair::new());
     let node_pubkey = node_keypair.pubkey();
 
-    // Generate the complete workload before enabling perf counters.
-    let workload = make_workload(
+    // Build the workload together with an exact oracle of which ShredIds
+    // must survive and which intentionally corrupted ShredIds must not.
+    let (
+        workload,
+        expected_valid_ids,
+        expected_invalid_ids,
+    ) = make_workload(
         leader_keypair.as_ref(),
         num_slots,
         batches_per_slot,
@@ -347,6 +433,12 @@ fn main() {
     assert_eq!(
         workload.iter().map(PacketBatch::len).sum::<usize>(),
         expected_shreds,
+    );
+    assert_eq!(expected_valid_ids.len(), expected_valid_shreds);
+    assert_eq!(expected_invalid_ids.len(), expected_invalid_shreds);
+    assert_eq!(
+        expected_valid_ids.len() + expected_invalid_ids.len(),
+        expected_shreds
     );
 
     let bank = Bank::new_for_tests(
@@ -369,7 +461,7 @@ fn main() {
     let (retransmit_sender, _retransmit_receiver) = EvictingSender::new_bounded(1);
 
     // Drain verified output continuously so sigverify cannot block on the
-    // downstream channel.
+    // downstream channel. Record every exact ShredId that reaches the output.
     let (verified_sender, verified_receiver) = bounded::<
         Vec<(
             solana_ledger::shred::Payload,
@@ -379,10 +471,21 @@ fn main() {
     >(CHANNEL_CAPACITY);
 
     let verified_handle = thread::spawn(move || {
-        verified_receiver
-            .into_iter()
-            .map(|shreds| shreds.len())
-            .sum::<usize>()
+        let mut verified_ids = HashSet::<ShredId>::new();
+
+        for shreds in verified_receiver {
+            for (payload, _is_repaired, _location) in shreds {
+                let shred_id = shred::layout::get_shred_id(payload.as_ref())
+                    .expect("verified output contains payload without a valid ShredId");
+
+                assert!(
+                    verified_ids.insert(shred_id),
+                    "verified output contains duplicate shred id: {shred_id:?}"
+                );
+            }
+        }
+
+        verified_ids
     });
 
     let repair_nonce_location_lookup: Arc<RepairNonceLocationLookup> = Arc::new(|_| None);
@@ -428,23 +531,24 @@ fn main() {
     drop(shred_fetch_sender);
 
     sigverify_handle
-    .join()
-    .expect("shred sigverify thread panicked");
+        .join()
+        .expect("shred sigverify thread panicked");
 
-    let verified_shreds = verified_handle
+    let verified_ids = verified_handle
         .join()
         .expect("verified shred consumer panicked");
 
+    let verified_shreds = verified_ids.len();
     let debug = sigverify_debug_counters();
 
     println!(
         "CRYPTO COUNTERS: \
-        verify_calls={} \
-        precrypto_rejects={} \
-        cache_hits={} \
-        crypto_calls={} \
-        crypto_success={} \
-        crypto_failed={}",
+         verify_calls={} \
+         precrypto_rejects={} \
+         cache_hits={} \
+         crypto_calls={} \
+         crypto_success={} \
+         crypto_failed={}",
         debug.verify_calls,
         debug.precrypto_rejects,
         debug.cache_hits,
@@ -455,13 +559,66 @@ fn main() {
 
     perf.disable();
 
-    assert!(
-        verified_shreds <= expected_valid_shreds,
-        "sigverify emitted {verified_shreds} shreds, but only \
-         {expected_valid_shreds} input shreds had valid leader signatures"
+    assert_eq!(
+        debug.verify_calls,
+        debug.precrypto_rejects + debug.cache_hits + debug.crypto_calls,
+        "verify-call accounting does not balance"
+    );
+    assert_eq!(
+        debug.crypto_calls,
+        debug.crypto_success + debug.crypto_failed,
+        "crypto-call accounting does not balance"
     );
 
-    let additional_discards = expected_valid_shreds - verified_shreds;
+    let missing_valid_count = expected_valid_ids.difference(&verified_ids).count();
+
+    let invalid_passed_count = expected_invalid_ids.intersection(&verified_ids).count();
+
+    let unexpected_output_count = verified_ids
+        .iter()
+        .filter(|shred_id| {
+            !expected_valid_ids.contains(shred_id)
+                && !expected_invalid_ids.contains(shred_id)
+        })
+        .count();
+
+    let missing_valid_sample: Vec<_> = expected_valid_ids
+        .difference(&verified_ids)
+        .take(10)
+        .copied()
+        .collect();
+
+    let invalid_passed_sample: Vec<_> = expected_invalid_ids
+        .intersection(&verified_ids)
+        .take(10)
+        .copied()
+        .collect();
+
+    let unexpected_output_sample: Vec<_> = verified_ids
+        .iter()
+        .filter(|shred_id| {
+            !expected_valid_ids.contains(shred_id)
+                && !expected_invalid_ids.contains(shred_id)
+        })
+        .take(10)
+        .copied()
+        .collect();
+
+    println!(
+        "EXACT OUTPUT CHECK: \
+         expected_valid={} \
+         expected_invalid={} \
+         actual_verified={} \
+         missing_valid={} \
+         invalid_passed={} \
+         unexpected_output={}",
+        expected_valid_ids.len(),
+        expected_invalid_ids.len(),
+        verified_ids.len(),
+        missing_valid_count,
+        invalid_passed_count,
+        unexpected_output_count,
+    );
 
     println!(
         "shred sigverify result: \
@@ -469,6 +626,32 @@ fn main() {
          intentionally_invalid={expected_invalid_shreds}, \
          expected_valid={expected_valid_shreds}, \
          verified={verified_shreds}, \
-         additional_discards={additional_discards}"
+         additional_discards={}",
+        expected_valid_shreds.saturating_sub(verified_shreds),
+    );
+
+    assert_eq!(
+        invalid_passed_count,
+        0,
+        "intentionally invalid shreds escaped sigverify: {invalid_passed_sample:?}"
+    );
+
+    assert_eq!(
+        unexpected_output_count,
+        0,
+        "sigverify emitted shreds that were not in the input workload: \
+         {unexpected_output_sample:?}"
+    );
+
+    assert_eq!(
+        missing_valid_count,
+        0,
+        "valid input shreds were lost: {missing_valid_sample:?}"
+    );
+
+    assert_eq!(
+        verified_ids,
+        expected_valid_ids,
+        "verified output ShredIds do not exactly match expected valid input ShredIds"
     );
 }
