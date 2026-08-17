@@ -72,6 +72,8 @@ pub type RepairNonceLocationLookup = dyn Fn(shred::Nonce) -> Option<BlockLocatio
 
 #[derive(Default)]
 struct SigverifyWorkerStats {
+    num_verify_calls: usize,
+    num_verify_failed: usize,
     num_discards_post: usize,
     num_invalid_retransmitter: usize,
     num_retranmitter_signature_skipped: usize,
@@ -82,6 +84,8 @@ struct SigverifyWorkerStats {
 
 impl SigverifyWorkerStats {
     fn accumulate(&mut self, other: Self) {
+        self.num_verify_calls += other.num_verify_calls;
+        self.num_verify_failed += other.num_verify_failed;
         self.num_discards_post += other.num_discards_post;
         self.num_invalid_retransmitter += other.num_invalid_retransmitter;
         self.num_retranmitter_signature_skipped += other.num_retranmitter_signature_skipped;
@@ -154,11 +158,14 @@ impl ShredSigverifyWorkers {
                                 continue;
                             }
 
+                            stats.num_verify_calls += 1;
+
                             if !verify_shred_cpu(
                                 packet.as_ref(),
                                 &context.slot_leaders,
                                 cache.as_ref(),
                             ) {
+                                stats.num_verify_failed += 1;
                                 packet.meta_mut().set_discard(true);
                                 stats.num_discards_post += 1;
                                 continue;
@@ -265,7 +272,8 @@ pub fn spawn_shred_sigverify(
         let mut rng = rand::rng();
         let deduper = Deduper::<2, [u8]>::new(&mut rng, DEDUPER_NUM_BITS);
         let mut shred_buffer = Vec::with_capacity(SIGVERIFY_SHRED_BATCH_SIZE);
-
+        let mut total_verify_calls = 0usize;
+        let mut total_verify_failed = 0usize;
         loop {
             if deduper.maybe_reset(&mut rng, DEDUPER_FALSE_POSITIVE_RATE, DEDUPER_RESET_CYCLE) {
                 stats.num_deduper_saturations += 1;
@@ -287,6 +295,9 @@ pub fn spawn_shred_sigverify(
                 repair_nonce_location_lookup.as_ref(),
                 &mut stats,
                 &mut shred_buffer,
+                & mut total_verify_calls,
+                & mut total_verify_failed,
+            
             ) {
                 Ok(()) => (),
                 Err(ShredSigverifyError::RecvTimeout) => (),
@@ -296,6 +307,11 @@ pub fn spawn_shred_sigverify(
 
             stats.maybe_submit();
         }
+        eprintln!(
+        "OURS TOTAL: verify_calls={} verify_failed={}",
+        total_verify_calls,
+        total_verify_failed,
+    );
     };
 
     Builder::new()
@@ -318,6 +334,8 @@ fn run_shred_sigverify<const K: usize>(
     repair_nonce_location_lookup: &RepairNonceLocationLookup,
     stats: &mut ShredSigVerifyStats,
     shred_buffer: &mut Vec<PacketBatch>,
+    total_verify_calls: &mut usize,
+total_verify_failed: &mut usize,
 ) -> Result<(), ShredSigverifyError> {
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -390,6 +408,8 @@ fn run_shred_sigverify<const K: usize>(
 
     let verify_and_resign_start = Instant::now();
     let worker_stats = workers.process_batches(shred_buffer, context);
+    *total_verify_calls += worker_stats.num_verify_calls;
+    *total_verify_failed += worker_stats.num_verify_failed;
     stats.verify_and_resign_micros += verify_and_resign_start.elapsed().as_micros() as u64;
     worker_stats.commit(stats);
 
