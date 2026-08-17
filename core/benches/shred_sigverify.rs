@@ -19,7 +19,7 @@ use {
         },
     },
     solana_net_utils::SocketAddrSpace,
-    solana_perf::packet::{PacketBatch, RecycledPacketBatch},
+    solana_perf::packet::{Packet, PacketBatch, RecycledPacketBatch},
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_signer::Signer,
     solana_streamer::evicting_sender::EvictingSender,
@@ -36,24 +36,25 @@ use {
     },
 };
 
-const SHREDS_PER_SLOT: usize = 2_500;
 const SLOT_DURATION: Duration = Duration::from_millis(400);
 
 const PACKETS_PER_BATCH: usize = 64;
 const CHANNEL_CAPACITY: usize = 1_024;
 
 const DEFAULT_NUM_SLOTS: usize = 50;
+const DEFAULT_BATCHES_PER_SLOT: usize = 500;
+const DEFAULT_INVALID_PACKETS_PER_SLOT: usize = 0;
 const DEFAULT_NUM_SIGVERIFY_THREADS: usize = 4;
 
 const FIRST_SLOT: u64 = 1;
 
 /// Optional control channel for `perf stat`.
 ///
-/// When PERF_CTL_FIFO is set, counters can be started only after the workload
-/// has been prepared and the sigverify workers have been spawned.
+/// When PERF_CTL_FIFO is set, counters can be started after workload
+/// preparation and worker creation.
 ///
-/// PERF_CTL_ACK_FIFO is optional, but when present it synchronizes enable/disable
-/// with perf before the benchmark proceeds.
+/// PERF_CTL_ACK_FIFO is optional. When present it synchronizes enable/disable
+/// commands with perf.
 struct PerfControl {
     control: Option<File>,
     ack: Option<BufReader<File>>,
@@ -131,7 +132,7 @@ fn env_usize(name: &str, default: usize) -> usize {
     match env::var(name) {
         Ok(value) => value
             .parse::<usize>()
-            .unwrap_or_else(|_| panic!("{name} must be a positive integer")),
+            .unwrap_or_else(|_| panic!("{name} must be an unsigned integer")),
         Err(_) => default,
     }
 }
@@ -141,25 +142,43 @@ fn shred_size_typical() -> usize {
     batch_payload / DATA_SHREDS_PER_FEC_BLOCK
 }
 
+fn should_corrupt_packet(
+    packet_index: usize,
+    packets_per_slot: usize,
+    invalid_packets_per_slot: usize,
+) -> bool {
+    if invalid_packets_per_slot == 0 {
+        return false;
+    }
+
+    packet_index * invalid_packets_per_slot / packets_per_slot
+        != (packet_index + 1) * invalid_packets_per_slot / packets_per_slot
+}
+
+fn corrupt_shred_signature(packet: &mut Packet) {
+    // The leader signature starts at the beginning of the shred payload.
+    // Flipping one signature byte keeps the shred layout intact while making
+    // signature verification fail.
+    packet.buffer_mut()[0] ^= 1;
+}
+
 fn make_slot_batches(
     leader_keypair: &Keypair,
     slot: u64,
-    shreds_per_slot: usize,
+    batches_per_slot: usize,
+    invalid_packets_per_slot: usize,
 ) -> Vec<PacketBatch> {
+    let shreds_per_slot = batches_per_slot * PACKETS_PER_BATCH;
     let shred_size = shred_size_typical();
 
-    // Same sizing logic already used by the existing shredder benchmark.
-    // Generate enough tick data to produce at least the requested number
-    // of shreds. Generation happens before perf counters are enabled.
     let ticks_per_shred = max_ticks_per_n_shreds(1, Some(shred_size)).max(1);
     let num_ticks = ticks_per_shred * shreds_per_slot as u64;
 
     let entries = create_ticks(num_ticks, 0, Hash::new_unique());
-
     let shredder = Shredder::new(slot, slot.saturating_sub(1), 0, 0).unwrap();
 
-    // Avoid turning the benchmark into a retransmitter-resigning benchmark.
-    // This workload measures the normal shred verification path.
+    // Use variants without retransmitter signatures so the workload primarily
+    // measures leader signature verification.
     let (data_shreds, coding_shreds) = shredder.entries_to_merkle_shreds_for_tests(
         leader_keypair,
         &entries,
@@ -183,29 +202,54 @@ fn make_slot_batches(
 
     shreds.truncate(shreds_per_slot);
 
-    shreds
-        .chunks(PACKETS_PER_BATCH)
-        .map(|shreds| {
-            let mut batch = RecycledPacketBatch::with_capacity(shreds.len());
+    let mut batches = Vec::with_capacity(batches_per_slot);
+    let mut corrupted_packets = 0usize;
 
-            for shred in shreds {
-                batch.push(shred.payload().to_packet(None));
+    for (batch_index, shreds) in shreds.chunks(PACKETS_PER_BATCH).enumerate() {
+        let mut batch = RecycledPacketBatch::with_capacity(shreds.len());
+
+        for (packet_index, shred) in shreds.iter().enumerate() {
+            let slot_packet_index = batch_index * PACKETS_PER_BATCH + packet_index;
+            let mut packet = shred.payload().to_packet(None);
+
+            if should_corrupt_packet(
+                slot_packet_index,
+                shreds_per_slot,
+                invalid_packets_per_slot,
+            ) {
+                corrupt_shred_signature(&mut packet);
+                corrupted_packets += 1;
             }
 
-            PacketBatch::from(batch)
-        })
-        .collect()
+            batch.push(packet);
+        }
+
+        batches.push(PacketBatch::from(batch));
+    }
+
+    assert_eq!(batches.len(), batches_per_slot);
+    assert_eq!(corrupted_packets, invalid_packets_per_slot);
+
+    batches
 }
 
-fn make_workload(leader_keypair: &Keypair, num_slots: usize) -> Vec<PacketBatch> {
-    let batches_per_slot = SHREDS_PER_SLOT.div_ceil(PACKETS_PER_BATCH);
-
+fn make_workload(
+    leader_keypair: &Keypair,
+    num_slots: usize,
+    batches_per_slot: usize,
+    invalid_packets_per_slot: usize,
+) -> Vec<PacketBatch> {
     let mut workload = Vec::with_capacity(num_slots * batches_per_slot);
 
     for slot_offset in 0..num_slots {
         let slot = FIRST_SLOT + slot_offset as u64;
 
-        workload.extend(make_slot_batches(leader_keypair, slot, SHREDS_PER_SLOT));
+        workload.extend(make_slot_batches(
+            leader_keypair,
+            slot,
+            batches_per_slot,
+            invalid_packets_per_slot,
+        ));
     }
 
     workload
@@ -213,15 +257,9 @@ fn make_workload(leader_keypair: &Keypair, num_slots: usize) -> Vec<PacketBatch>
 
 /// Returns the target arrival time for `num_shreds` from the start of replay.
 ///
-/// The rate is derived from the workload model:
-///
-///     2_500 shreds / 400 ms
-///     = 6_250 shreds / second
-///
-/// Keeping slot duration and shreds-per-slot as the source of truth avoids
-/// maintaining a separate, potentially inconsistent shreds-per-second value.
-fn arrival_offset(num_shreds: usize) -> Duration {
-    let nanos = num_shreds as u128 * SLOT_DURATION.as_nanos() / SHREDS_PER_SLOT as u128;
+/// The replay rate is derived from the number of shreds per 400 ms slot.
+fn arrival_offset(num_shreds: usize, shreds_per_slot: usize) -> Duration {
+    let nanos = num_shreds as u128 * SLOT_DURATION.as_nanos() / shreds_per_slot as u128;
 
     Duration::from_nanos(nanos as u64)
 }
@@ -241,30 +279,67 @@ fn sleep_until(deadline: Instant) {
 fn main() {
     let num_slots = env_usize("SHRED_SIGVERIFY_SLOTS", DEFAULT_NUM_SLOTS);
 
+    let batches_per_slot = env_usize(
+        "SHRED_SIGVERIFY_BATCHES_PER_SLOT",
+        DEFAULT_BATCHES_PER_SLOT,
+    );
+
+    let invalid_packets_per_slot = env_usize(
+        "SHRED_SIGVERIFY_INVALID_PACKETS_PER_SLOT",
+        DEFAULT_INVALID_PACKETS_PER_SLOT,
+    );
+
     let num_sigverify_threads = NonZeroUsize::new(env_usize(
         "SHRED_SIGVERIFY_THREADS",
         DEFAULT_NUM_SIGVERIFY_THREADS,
     ))
     .expect("SHRED_SIGVERIFY_THREADS must be greater than zero");
 
-    assert!(num_slots > 0);
+    assert!(num_slots > 0, "SHRED_SIGVERIFY_SLOTS must be greater than zero");
+    assert!(
+        batches_per_slot > 0,
+        "SHRED_SIGVERIFY_BATCHES_PER_SLOT must be greater than zero"
+    );
+
+    let shreds_per_slot = batches_per_slot * PACKETS_PER_BATCH;
+
+    assert!(
+        invalid_packets_per_slot <= shreds_per_slot,
+        "SHRED_SIGVERIFY_INVALID_PACKETS_PER_SLOT must not exceed packets per slot"
+    );
+
+    let expected_shreds = num_slots * shreds_per_slot;
+    let expected_invalid_shreds = num_slots * invalid_packets_per_slot;
+    let expected_valid_shreds = expected_shreds - expected_invalid_shreds;
+
+    println!(
+        "shred sigverify workload: \
+         slots={num_slots}, \
+         batches_per_slot={batches_per_slot}, \
+         packets_per_batch={PACKETS_PER_BATCH}, \
+         shreds_per_slot={shreds_per_slot}, \
+         invalid_packets_per_slot={invalid_packets_per_slot}, \
+         total_shreds={expected_shreds}, \
+         intentionally_invalid={expected_invalid_shreds}, \
+         sigverify_threads={num_sigverify_threads}"
+    );
 
     let leader_keypair = Arc::new(Keypair::new());
     let leader_pubkey = leader_keypair.pubkey();
 
     // The validator running sigverify must not be the leader.
-    // get_slot_leaders() intentionally rejects shreds produced by the
-    // validator itself.
     let node_keypair = Arc::new(Keypair::new());
     let node_pubkey = node_keypair.pubkey();
 
-    //
-    // Prepare the complete workload before starting perf counters.
-    //
-    let workload = make_workload(leader_keypair.as_ref(), num_slots);
+    // Generate the complete workload before enabling perf counters.
+    let workload = make_workload(
+        leader_keypair.as_ref(),
+        num_slots,
+        batches_per_slot,
+        invalid_packets_per_slot,
+    );
 
-    let expected_shreds = num_slots * SHREDS_PER_SLOT;
-
+    assert_eq!(workload.len(), num_slots * batches_per_slot);
     assert_eq!(
         workload.iter().map(PacketBatch::len).sum::<usize>(),
         expected_shreds,
@@ -275,7 +350,6 @@ fn main() {
     );
 
     let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-
     let bank_forks = BankForks::new_rw_arc(bank);
 
     let cluster_info = Arc::new(ClusterInfo::new(
@@ -284,23 +358,14 @@ fn main() {
         SocketAddrSpace::Unspecified,
     ));
 
-    //
-    // Use bounded channels so the benchmark models finite pipeline capacity
-    // rather than allowing an unlimited backlog.
-    //
-    let (shred_fetch_sender, shred_fetch_receiver) = bounded::<PacketBatch>(CHANNEL_CAPACITY);
+    let (shred_fetch_sender, shred_fetch_receiver) =
+        bounded::<PacketBatch>(CHANNEL_CAPACITY);
 
-    //
-    // Retransmit output is intentionally tiny and evicting because retransmit
-    // consumption itself is outside the scope of this benchmark.
-    //
+    // Retransmit consumption itself is outside this benchmark.
     let (retransmit_sender, _retransmit_receiver) = EvictingSender::new_bounded(1);
 
-    //
-    // Window-service output is bounded and actively drained while sigverify
-    // runs. Otherwise a bounded receiver would eventually fill and block
-    // sigverify for reasons unrelated to verification performance.
-    //
+    // Drain verified output continuously so sigverify cannot block on the
+    // downstream channel.
     let (verified_sender, verified_receiver) = bounded::<
         Vec<(
             solana_ledger::shred::Payload,
@@ -318,9 +383,7 @@ fn main() {
 
     let repair_nonce_location_lookup: Arc<RepairNonceLocationLookup> = Arc::new(|_| None);
 
-    //
     // Worker creation is outside the measured section.
-    //
     let sigverify_handle = spawn_shred_sigverify(
         cluster_info,
         bank_forks,
@@ -334,16 +397,13 @@ fn main() {
 
     let mut perf = PerfControl::from_env();
 
-    //
-    // Measurement starts here.
-    //
     perf.enable();
 
     let replay_start = Instant::now();
     let mut sent_shreds = 0usize;
 
     for batch in workload {
-        let deadline = replay_start + arrival_offset(sent_shreds);
+        let deadline = replay_start + arrival_offset(sent_shreds, shreds_per_slot);
 
         sleep_until(deadline);
 
@@ -358,34 +418,33 @@ fn main() {
 
     assert_eq!(sent_shreds, expected_shreds);
 
-    //
-    // Closing ingress lets sigverify consume everything already queued
-    // and terminate once the workload has completely drained.
-    //
+    // Closing ingress lets sigverify drain all queued batches and terminate.
     drop(shred_fetch_sender);
 
     sigverify_handle
         .join()
         .expect("shred sigverify thread panicked");
 
-    //
-    // The sigverify sender is gone after the stage exits, so the verified
-    // consumer drains the remaining output and terminates.
-    //
     let verified_shreds = verified_handle
         .join()
         .expect("verified shred consumer panicked");
 
-    //
-    // Measurement ends only after the complete measured pipeline has drained.
-    //
     perf.disable();
 
-    //
-    // Validation itself happens outside the measured region.
-    //
-    assert_eq!(
-        verified_shreds, expected_shreds,
-        "some shreds did not survive sigverify",
+    assert!(
+        verified_shreds <= expected_valid_shreds,
+        "sigverify emitted {verified_shreds} shreds, but only \
+         {expected_valid_shreds} input shreds had valid leader signatures"
+    );
+
+    let additional_discards = expected_valid_shreds - verified_shreds;
+
+    println!(
+        "shred sigverify result: \
+         sent={sent_shreds}, \
+         intentionally_invalid={expected_invalid_shreds}, \
+         expected_valid={expected_valid_shreds}, \
+         verified={verified_shreds}, \
+         additional_discards={additional_discards}"
     );
 }

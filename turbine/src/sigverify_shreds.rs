@@ -5,7 +5,6 @@ use {
     },
     agave_feature_set as feature_set,
     crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender, bounded},
-    itertools::{Either, Itertools},
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
@@ -29,10 +28,7 @@ use {
     solana_streamer::{evicting_sender::EvictingSender, streamer::ChannelSend},
     std::{
         num::NonZeroUsize,
-        sync::{
-            Arc, RwLock,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::{Arc, RwLock},
         thread::{Builder, JoinHandle},
         time::{Duration, Instant},
     },
@@ -75,7 +71,8 @@ enum ResignError {
 pub type RepairNonceLocationLookup = dyn Fn(shred::Nonce) -> Option<BlockLocation> + Send + Sync;
 
 #[derive(Default)]
-struct ResignWorkerStats {
+struct SigverifyWorkerStats {
+    num_discards_post: usize,
     num_invalid_retransmitter: usize,
     num_retranmitter_signature_skipped: usize,
     num_retranmitter_signature_verified: usize,
@@ -83,8 +80,9 @@ struct ResignWorkerStats {
     num_unknown_turbine_parent: usize,
 }
 
-impl ResignWorkerStats {
+impl SigverifyWorkerStats {
     fn accumulate(&mut self, other: Self) {
+        self.num_discards_post += other.num_discards_post;
         self.num_invalid_retransmitter += other.num_invalid_retransmitter;
         self.num_retranmitter_signature_skipped += other.num_retranmitter_signature_skipped;
         self.num_retranmitter_signature_verified += other.num_retranmitter_signature_verified;
@@ -92,51 +90,31 @@ impl ResignWorkerStats {
         self.num_unknown_turbine_parent += other.num_unknown_turbine_parent;
     }
 
-    fn commit(self, stats: &ShredSigVerifyStats) {
-        stats
-            .num_invalid_retransmitter
-            .fetch_add(self.num_invalid_retransmitter, Ordering::Relaxed);
-
-        stats
-            .num_retranmitter_signature_skipped
-            .fetch_add(self.num_retranmitter_signature_skipped, Ordering::Relaxed);
-
-        stats
-            .num_retranmitter_signature_verified
-            .fetch_add(self.num_retranmitter_signature_verified, Ordering::Relaxed);
-
-        stats
-            .num_unknown_slot_leader
-            .fetch_add(self.num_unknown_slot_leader, Ordering::Relaxed);
-
-        stats
-            .num_unknown_turbine_parent
-            .fetch_add(self.num_unknown_turbine_parent, Ordering::Relaxed);
+    fn commit(self, stats: &mut ShredSigVerifyStats) {
+        stats.num_discards_post += self.num_discards_post;
+        stats.num_invalid_retransmitter += self.num_invalid_retransmitter;
+        stats.num_retranmitter_signature_skipped += self.num_retranmitter_signature_skipped;
+        stats.num_retranmitter_signature_verified += self.num_retranmitter_signature_verified;
+        stats.num_unknown_slot_leader += self.num_unknown_slot_leader;
+        stats.num_unknown_turbine_parent += self.num_unknown_turbine_parent;
     }
 }
 
-struct ResignContext {
+struct SigverifyContext {
+    slot_leaders: SlotPubkeys,
     root_bank: Arc<Bank>,
     working_bank: Arc<Bank>,
     keypair: Arc<Keypair>,
 }
 
-#[derive(Clone)]
-enum BatchOperation {
-    Verify(Arc<SlotPubkeys>),
-    Resign(Arc<ResignContext>),
-}
-
 struct BatchJob {
-    batch_index: usize,
     batch: PacketBatch,
-    operation: BatchOperation,
+    context: Arc<SigverifyContext>,
 }
 
 struct BatchResult {
-    batch_index: usize,
     batch: PacketBatch,
-    resign_stats: ResignWorkerStats,
+    stats: SigverifyWorkerStats,
 }
 
 struct ShredSigverifyWorkers {
@@ -152,11 +130,8 @@ impl ShredSigverifyWorkers {
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         cluster_nodes_cache: Arc<ClusterNodesCache<RetransmitStage>>,
     ) -> Self {
-        let (job_sender, job_receiver) =
-            bounded::<BatchJob>(SIGVERIFY_SHRED_BATCH_SIZE);
-
-        let (result_sender, result_receiver) =
-            bounded::<BatchResult>(SIGVERIFY_SHRED_BATCH_SIZE);
+        let (job_sender, job_receiver) = bounded::<BatchJob>(SIGVERIFY_SHRED_BATCH_SIZE);
+        let (result_sender, result_receiver) = bounded::<BatchResult>(SIGVERIFY_SHRED_BATCH_SIZE);
 
         for index in 0..num_workers.get() {
             let job_receiver = job_receiver.clone();
@@ -170,64 +145,42 @@ impl ShredSigverifyWorkers {
             Builder::new()
                 .name(format!("solSvrfyShred{index:02}"))
                 .spawn(move || {
-                    while let Ok(job) = job_receiver.recv() {
-                        let BatchJob {
-                            batch_index,
-                            mut batch,
-                            operation,
-                        } = job;
+                    while let Ok(BatchJob { mut batch, context }) = job_receiver.recv() {
+                        let mut stats = SigverifyWorkerStats::default();
 
-                        let mut resign_stats = ResignWorkerStats::default();
-
-                        match operation {
-                            BatchOperation::Verify(slot_leaders) => {
-                                for mut packet in batch.iter_mut() {
-                                    if packet.meta().discard() {
-                                        continue;
-                                    }
-
-                                    if !verify_shred_cpu(
-                                        packet.as_ref(),
-                                        slot_leaders.as_ref(),
-                                        cache.as_ref(),
-                                    ) {
-                                        packet.meta_mut().set_discard(true);
-                                    }
-                                }
+                        for mut packet in batch.iter_mut() {
+                            if packet.meta().discard() {
+                                stats.num_discards_post += 1;
+                                continue;
                             }
 
-                            BatchOperation::Resign(context) => {
-                                for mut packet in batch.iter_mut() {
-                                    if packet.meta().discard() {
-                                        continue;
-                                    }
+                            if !verify_shred_cpu(
+                                packet.as_ref(),
+                                &context.slot_leaders,
+                                cache.as_ref(),
+                            ) {
+                                packet.meta_mut().set_discard(true);
+                                stats.num_discards_post += 1;
+                                continue;
+                            }
 
-                                    if maybe_verify_and_resign_packet(
-                                        &mut packet,
-                                        context.root_bank.as_ref(),
-                                        context.working_bank.as_ref(),
-                                        cluster_info.as_ref(),
-                                        leader_schedule_cache.as_ref(),
-                                        cluster_nodes_cache.as_ref(),
-                                        &mut resign_stats,
-                                        context.keypair.as_ref(),
-                                    )
-                                    .is_err()
-                                    {
-                                        packet.meta_mut().set_discard(true);
-                                    }
-                                }
+                            if maybe_verify_and_resign_packet(
+                                &mut packet,
+                                context.root_bank.as_ref(),
+                                context.working_bank.as_ref(),
+                                cluster_info.as_ref(),
+                                leader_schedule_cache.as_ref(),
+                                cluster_nodes_cache.as_ref(),
+                                &mut stats,
+                                context.keypair.as_ref(),
+                            )
+                            .is_err()
+                            {
+                                packet.meta_mut().set_discard(true);
                             }
                         }
 
-                        if result_sender
-                            .send(BatchResult {
-                                batch_index,
-                                batch,
-                                resign_stats,
-                            })
-                            .is_err()
-                        {
+                        if result_sender.send(BatchResult { batch, stats }).is_err() {
                             break;
                         }
                     }
@@ -244,52 +197,40 @@ impl ShredSigverifyWorkers {
     fn process_batches(
         &self,
         packets: &mut Vec<PacketBatch>,
-        operation: BatchOperation,
-    ) -> ResignWorkerStats {
+        context: Arc<SigverifyContext>,
+    ) -> SigverifyWorkerStats {
         if packets.is_empty() {
-            return ResignWorkerStats::default();
+            return SigverifyWorkerStats::default();
         }
-        assert!(packets.len() <= SIGVERIFY_SHRED_BATCH_SIZE);
+
+        debug_assert!(packets.len() <= SIGVERIFY_SHRED_BATCH_SIZE);
+
         let num_batches = packets.len();
+        let mut stats = SigverifyWorkerStats::default();
 
-        let mut completed = std::iter::repeat_with(|| None)
-            .take(num_batches)
-            .collect::<Vec<Option<PacketBatch>>>();
-
-        let mut resign_stats = ResignWorkerStats::default();
-
-        for (batch_index, batch) in std::mem::take(packets).into_iter().enumerate() {
+        for batch in packets.drain(..) {
             self.job_sender
                 .send(BatchJob {
-                    batch_index,
                     batch,
-                    operation: operation.clone(),
+                    context: context.clone(),
                 })
                 .expect("shred sigverify workers must be alive");
         }
 
         for _ in 0..num_batches {
             let BatchResult {
-                batch_index,
                 batch,
-                resign_stats: worker_stats,
+                stats: worker_stats,
             } = self
                 .result_receiver
                 .recv()
                 .expect("shred sigverify worker must return a result");
 
-            debug_assert!(completed[batch_index].is_none());
-
-            completed[batch_index] = Some(batch);
-            resign_stats.accumulate(worker_stats);
+            packets.push(batch);
+            stats.accumulate(worker_stats);
         }
 
-        *packets = completed
-            .into_iter()
-            .map(|batch| batch.expect("every packet batch must be returned"))
-            .collect();
-
-        resign_stats
+        stats
     }
 }
 
@@ -320,7 +261,7 @@ pub fn spawn_shred_sigverify(
         cluster_nodes_cache,
     );
 
-    let run_shred_sigverify = move || {
+    let run = move || {
         let mut rng = rand::rng();
         let deduper = Deduper::<2, [u8]>::new(&mut rng, DEDUPER_NUM_BITS);
         let mut shred_buffer = Vec::with_capacity(SIGVERIFY_SHRED_BATCH_SIZE);
@@ -359,9 +300,10 @@ pub fn spawn_shred_sigverify(
 
     Builder::new()
         .name("solShredVerifr".to_string())
-        .spawn(run_shred_sigverify)
+        .spawn(run)
         .unwrap()
 }
+
 
 #[allow(clippy::too_many_arguments)]
 fn run_shred_sigverify<const K: usize>(
@@ -392,6 +334,7 @@ fn run_shred_sigverify<const K: usize>(
     }
 
     let now = Instant::now();
+
     stats.num_iters += 1;
     stats.num_batches += shred_buffer.len();
     stats.num_discards_pre += count_discards(shred_buffer);
@@ -427,100 +370,96 @@ fn run_shred_sigverify<const K: usize>(
         (bank_forks.working_bank(), bank_forks.root_bank())
     };
 
-    verify_packets(
-        workers,
-        &keypair.pubkey(),
-        &working_bank,
+    let self_pubkey = keypair.pubkey();
+    let slot_leaders = get_slot_leaders(
+        &self_pubkey,
+        shred_buffer,
         leader_schedule_cache,
-        shred_buffer,
-    );
+        &working_bank,
+    )
+    .filter_map(|(slot, pubkey)| pubkey.map(|pubkey| (slot, pubkey)))
+    .chain(std::iter::once((Slot::MAX, Pubkey::default())))
+    .collect::<SlotPubkeys>();
 
-    stats.num_discards_post += count_discards(shred_buffer);
-
-    // Verify retransmitter signatures and resign packets in-place in the
-    // persistent worker threads.
-    let resign_start = Instant::now();
-
-    resign_packets(
-        workers,
-        shred_buffer,
+    let context = Arc::new(SigverifyContext {
+        slot_leaders,
         root_bank,
         working_bank,
-        keypair.clone(),
-        stats,
-    );
+        keypair: keypair.clone(),
+    });
 
-    stats.resign_micros += resign_start.elapsed().as_micros() as u64;
+    let verify_and_resign_start = Instant::now();
+    let worker_stats = workers.process_batches(shred_buffer, context);
+    stats.verify_and_resign_micros += verify_and_resign_start.elapsed().as_micros() as u64;
+    worker_stats.commit(stats);
 
-    // Extract shred payload from packets, and separate out repaired shreds.
-    let (shreds, repairs): (Vec<_>, Vec<_>) = shred_buffer
+    let mut retransmit_shreds = Vec::new();
+    let mut verified_shreds = Vec::new();
+
+    for packet in shred_buffer
         .iter()
         .flat_map(|batch| batch.iter())
         .filter(|packet| !packet.meta().discard())
-        .filter_map(|packet| {
+    {
+        let Some((shred, location)) =
             extract_shred_and_location(packet, repair_nonce_location_lookup, stats)
-        })
-        .partition_map(|(shred, location)| {
-            if let Some(location) = location {
-                // No need for Arc overhead here because repaired shreds are
-                // not retransmitted.
-                Either::Right((
-                    shred::Payload::from(shred),
-                    /* is_repaired */ true,
-                    location,
-                ))
-            } else {
-                // Share the payload between the retransmit-stage and the
-                // window-service.
-                Either::Left(shred::Payload::from(shred))
-            }
-        });
+        else {
+            continue;
+        };
 
-    // Repaired shreds are not retransmitted.
-    stats.num_retransmit_shreds += shreds.len();
+        if let Some(location) = location {
+            verified_shreds.push((shred, /* is_repaired */ true, location));
+        } else {
+            retransmit_shreds.push(shred.clone());
+            verified_shreds.push((shred, /* is_repaired */ false, BlockLocation::Original));
+        }
+    }
 
-    if let Err(send_err) = retransmit_sender.try_send(shreds.clone()) {
+    stats.num_retransmit_shreds += retransmit_shreds.len();
+
+    if let Err(send_err) = retransmit_sender.try_send(retransmit_shreds) {
         match send_err {
-            crossbeam_channel::TrySendError::Full(v) => {
-                stats.num_retransmit_stage_overflow_shreds += v.len();
+            crossbeam_channel::TrySendError::Full(shreds) => {
+                stats.num_retransmit_stage_overflow_shreds += shreds.len();
             }
             _ => unreachable!("EvictingSender holds on to both ends of the channel"),
         }
     }
 
-    // Send all shreds to window service to be inserted into blockstore.
-    let shreds = shreds
-        .into_iter()
-        .map(|shred| (shred, /*is_repaired:*/ false, BlockLocation::Original));
-
-    verified_sender.send(shreds.chain(repairs).collect())?;
+    verified_sender.send(verified_shreds)?;
 
     stats.elapsed_micros += now.elapsed().as_micros() as u64;
     shred_buffer.clear();
 
     Ok(())
 }
-/// Extracts shred bytes and, for repaired shreds, the location where the shred
-/// should be inserted into blockstore.
+
 fn extract_shred_and_location(
     packet: PacketRef,
     repair_nonce_location_lookup: &RepairNonceLocationLookup,
     stats: &mut ShredSigVerifyStats,
-) -> Option<(Vec<u8>, Option<BlockLocation>)> {
-    let (shred, nonce) = shred::layout::get_shred_and_repair_nonce(packet)?;
-    let Some(nonce) = nonce else {
-        // Turbine shred.
-        return Some((shred.to_vec(), None));
+) -> Option<(shred::Payload, Option<BlockLocation>)> {
+    let (shred_bytes, nonce) = shred::layout::get_shred_and_repair_nonce(packet)?;
+
+    let location = match nonce {
+        None => None,
+        Some(nonce) => match repair_nonce_location_lookup(nonce) {
+            Some(location) => Some(location),
+            None => {
+                stats.num_unknown_block_location += 1;
+                return None;
+            }
+        },
     };
 
-    // Repair shred.
-    if let Some(location) = repair_nonce_location_lookup(nonce) {
-        Some((shred.to_vec(), Some(location)))
-    } else {
-        // This indicates the request entry was evicted before consumption.
-        stats.num_unknown_block_location += 1;
-        None
-    }
+    let payload = match packet {
+        PacketRef::Packet(_) => shred::Payload::from(shred_bytes.to_vec()),
+        PacketRef::Bytes(packet) => {
+            shred::Payload::from(packet.buffer().slice(..shred_bytes.len()))
+        }
+    };
+
+    Some((payload, location))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -531,7 +470,7 @@ fn maybe_verify_and_resign_packet(
     cluster_info: &ClusterInfo,
     leader_schedule_cache: &LeaderScheduleCache,
     cluster_nodes_cache: &ClusterNodesCache<RetransmitStage>,
-    stats: &mut ResignWorkerStats,
+    stats: &mut SigverifyWorkerStats,
     keypair: &Keypair,
 ) -> Result<(), ResignError> {
     let repair = packet.meta().repair();
@@ -583,7 +522,7 @@ fn verify_retransmitter_signature(
     cluster_info: &ClusterInfo,
     leader_schedule_cache: &LeaderScheduleCache,
     cluster_nodes_cache: &ClusterNodesCache<RetransmitStage>,
-    stats: &mut ResignWorkerStats,
+    stats: &mut SigverifyWorkerStats,
 ) -> bool {
     let signature = match shred::layout::get_retransmitter_signature(shred) {
         Ok(signature) => signature,
@@ -629,47 +568,9 @@ fn verify_retransmitter_signature(
     }
 }
 
-fn resign_packets(
-    workers: &ShredSigverifyWorkers,
-    packets: &mut Vec<PacketBatch>,
-    root_bank: Arc<Bank>,
-    working_bank: Arc<Bank>,
-    keypair: Arc<Keypair>,
-    stats: &ShredSigVerifyStats,
-) {
-    let context = Arc::new(ResignContext {
-        root_bank,
-        working_bank,
-        keypair,
-    });
-
-    let worker_stats = workers.process_batches(packets, BatchOperation::Resign(context));
-
-    worker_stats.commit(stats);
-}
-
-fn verify_packets(
-    workers: &ShredSigverifyWorkers,
-    self_pubkey: &Pubkey,
-    working_bank: &Bank,
-    leader_schedule_cache: &LeaderScheduleCache,
-    packets: &mut Vec<PacketBatch>,
-) {
-    let leader_slots = Arc::new(
-        get_slot_leaders(self_pubkey, packets, leader_schedule_cache, working_bank)
-            .filter_map(|(slot, pubkey)| Some((slot, pubkey?)))
-            .chain(std::iter::once((Slot::MAX, Pubkey::default())))
-            .collect::<SlotPubkeys>(),
-    );
-
-    workers.process_batches(packets, BatchOperation::Verify(leader_slots));
-}
-
-// Returns pubkey of leaders for shred slots referenced in the packets.
-// Marks packets as discard if:
-//   - fails to deserialize the shred slot.
-//   - slot leader is unknown.
-//   - slot leader is the node itself (circular transmission).
+// Returns leader pubkeys for shred slots referenced in the packets.
+// Packets with an unknown leader or this node as leader are marked for discard.
+// Packets whose shred slot cannot be parsed are omitted from the iterator.
 fn get_slot_leaders<'a>(
     self_pubkey: &'a Pubkey,
     batches: &'a mut [PacketBatch],
@@ -726,18 +627,18 @@ struct ShredSigVerifyStats {
     num_discards_post: usize,
     num_discards_pre: usize,
     num_duplicates: usize,
-    num_invalid_retransmitter: AtomicUsize,
-    num_retranmitter_signature_skipped: AtomicUsize,
-    num_retranmitter_signature_verified: AtomicUsize,
+    num_invalid_retransmitter: usize,
+    num_retranmitter_signature_skipped: usize,
+    num_retranmitter_signature_verified: usize,
     num_retransmit_stage_overflow_shreds: usize,
     num_retransmit_shreds: usize,
     /// This means the OutstandingRequests cache is saturated and we
     /// threw away a verified shred due to being unable to fetch the storage location
     num_unknown_block_location: usize,
-    num_unknown_slot_leader: AtomicUsize,
-    num_unknown_turbine_parent: AtomicUsize,
+    num_unknown_slot_leader: usize,
+    num_unknown_turbine_parent: usize,
     elapsed_micros: u64,
-    resign_micros: u64,
+    verify_and_resign_micros: u64,
 }
 
 impl ShredSigVerifyStats {
@@ -746,23 +647,23 @@ impl ShredSigVerifyStats {
     fn new(now: Instant) -> Self {
         Self {
             since: now,
-            num_iters: 0usize,
-            num_batches: 0usize,
-            num_packets: 0usize,
-            num_discards_pre: 0usize,
-            num_deduper_saturations: 0usize,
-            num_discards_post: 0usize,
-            num_duplicates: 0usize,
-            num_invalid_retransmitter: AtomicUsize::default(),
-            num_retranmitter_signature_skipped: AtomicUsize::default(),
-            num_retranmitter_signature_verified: AtomicUsize::default(),
-            num_retransmit_stage_overflow_shreds: 0usize,
-            num_retransmit_shreds: 0usize,
-            num_unknown_block_location: 0usize,
-            num_unknown_slot_leader: AtomicUsize::default(),
-            num_unknown_turbine_parent: AtomicUsize::default(),
-            elapsed_micros: 0u64,
-            resign_micros: 0u64,
+            num_iters: 0,
+            num_batches: 0,
+            num_packets: 0,
+            num_discards_pre: 0,
+            num_deduper_saturations: 0,
+            num_discards_post: 0,
+            num_duplicates: 0,
+            num_invalid_retransmitter: 0,
+            num_retranmitter_signature_skipped: 0,
+            num_retranmitter_signature_verified: 0,
+            num_retransmit_stage_overflow_shreds: 0,
+            num_retransmit_shreds: 0,
+            num_unknown_block_location: 0,
+            num_unknown_slot_leader: 0,
+            num_unknown_turbine_parent: 0,
+            elapsed_micros: 0,
+            verify_and_resign_micros: 0,
         }
     }
 
@@ -770,6 +671,7 @@ impl ShredSigVerifyStats {
         if self.since.elapsed() <= Self::METRICS_SUBMIT_CADENCE {
             return;
         }
+
         datapoint_info!(
             "shred_sigverify",
             ("num_iters", self.num_iters, i64),
@@ -781,19 +683,17 @@ impl ShredSigVerifyStats {
             ("num_duplicates", self.num_duplicates, i64),
             (
                 "num_invalid_retransmitter",
-                self.num_invalid_retransmitter.load(Ordering::Relaxed),
+                self.num_invalid_retransmitter,
                 i64
             ),
             (
                 "num_retranmitter_signature_skipped",
-                self.num_retranmitter_signature_skipped
-                    .load(Ordering::Relaxed),
+                self.num_retranmitter_signature_skipped,
                 i64
             ),
             (
                 "num_retranmitter_signature_verified",
-                self.num_retranmitter_signature_verified
-                    .load(Ordering::Relaxed),
+                self.num_retranmitter_signature_verified,
                 i64
             ),
             (
@@ -807,22 +707,24 @@ impl ShredSigVerifyStats {
                 self.num_unknown_block_location,
                 i64
             ),
-            (
-                "num_unknown_slot_leader",
-                self.num_unknown_slot_leader.load(Ordering::Relaxed),
-                i64
-            ),
+            ("num_unknown_slot_leader", self.num_unknown_slot_leader, i64),
             (
                 "num_unknown_turbine_parent",
-                self.num_unknown_turbine_parent.load(Ordering::Relaxed),
+                self.num_unknown_turbine_parent,
                 i64
             ),
             ("elapsed_micros", self.elapsed_micros, i64),
-            ("resign_micros", self.resign_micros, i64),
+            (
+                "verify_and_resign_micros",
+                self.verify_and_resign_micros,
+                i64
+            ),
         );
+
         *self = Self::new(Instant::now());
     }
 }
+
 #[cfg(test)]
 mod tests {
     use {
@@ -850,7 +752,6 @@ mod tests {
         num_workers: usize,
     ) -> ShredSigverifyWorkers {
         let cache = Arc::new(RwLock::new(LruCache::new(/*capacity:*/ 128)));
-
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<RetransmitStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
@@ -869,37 +770,30 @@ mod tests {
     fn test_sigverify_shreds_verify_batches() {
         let leader_keypair = Arc::new(Keypair::new());
         let wrong_keypair = Keypair::new();
+        let node_keypair = Arc::new(Keypair::new());
         let leader_pubkey = leader_keypair.pubkey();
+        let node_pubkey = node_keypair.pubkey();
 
         let bank = Bank::new_for_tests(
             &create_genesis_config_with_leader(100, &leader_pubkey, 10).genesis_config,
         );
-
         let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-
         let bank_forks = BankForks::new_rw_arc(bank);
 
         let cluster_info = Arc::new(ClusterInfo::new(
-            ContactInfo::new_localhost(&leader_pubkey, timestamp()),
-            leader_keypair.clone(),
+            ContactInfo::new_localhost(&node_pubkey, timestamp()),
+            node_keypair.clone(),
             SocketAddrSpace::Unspecified,
         ));
-
         let workers = new_sigverify_workers(cluster_info, leader_schedule_cache.clone(), 3);
-
-        let batch_size = 2;
-        let mut batch = RecycledPacketBatch::with_capacity(batch_size);
-        batch.resize(batch_size, Packet::default());
-
-        let mut batches = vec![batch];
 
         let entries = create_ticks(1, 1, Hash::new_unique());
         let shredder = Shredder::new(1, 0, 1, 0).unwrap();
 
-        let (shreds_data, _shreds_code) = shredder.entries_to_merkle_shreds_for_tests(
+        let (valid_shreds, _) = shredder.entries_to_merkle_shreds_for_tests(
             &leader_keypair,
             &entries,
-            true,
+            false,
             Hash::new_unique(),
             0,
             0,
@@ -907,10 +801,10 @@ mod tests {
             &mut ProcessShredsStats::default(),
         );
 
-        let (shreds_data_wrong, _shreds_code_wrong) = shredder.entries_to_merkle_shreds_for_tests(
+        let (invalid_shreds, _) = shredder.entries_to_merkle_shreds_for_tests(
             &wrong_keypair,
             &entries,
-            true,
+            false,
             Hash::new_unique(),
             0,
             0,
@@ -918,40 +812,49 @@ mod tests {
             &mut ProcessShredsStats::default(),
         );
 
-        let shred = shreds_data[0].clone();
-        batches[0][0].buffer_mut()[..shred.payload().len()].copy_from_slice(shred.payload());
-        batches[0][0].meta_mut().size = shred.payload().len();
+        let mut batch = RecycledPacketBatch::with_capacity(2);
+        batch.resize(2, Packet::default());
 
-        let shred = shreds_data_wrong[0].clone();
-        batches[0][1].buffer_mut()[..shred.payload().len()].copy_from_slice(shred.payload());
-        batches[0][1].meta_mut().size = shred.payload().len();
+        let shred = &valid_shreds[0];
+        batch[0].buffer_mut()[..shred.payload().len()].copy_from_slice(shred.payload());
+        batch[0].meta_mut().size = shred.payload().len();
 
-        let working_bank = bank_forks.read().unwrap().working_bank();
+        let shred = &invalid_shreds[0];
+        batch[1].buffer_mut()[..shred.payload().len()].copy_from_slice(shred.payload());
+        batch[1].meta_mut().size = shred.payload().len();
 
-        let mut batches = batches
-            .into_iter()
-            .map(PacketBatch::from)
-            .collect::<Vec<_>>();
+        let mut batches = vec![PacketBatch::from(batch)];
+        let (working_bank, root_bank) = {
+            let bank_forks = bank_forks.read().unwrap();
+            (bank_forks.working_bank(), bank_forks.root_bank())
+        };
 
-        verify_packets(
-            &workers,
-            &Pubkey::new_unique(), // self_pubkey
-            &working_bank,
-            leader_schedule_cache.as_ref(),
+        let slot_leaders = get_slot_leaders(
+            &node_pubkey,
             &mut batches,
+            leader_schedule_cache.as_ref(),
+            &working_bank,
+        )
+        .filter_map(|(slot, pubkey)| pubkey.map(|pubkey| (slot, pubkey)))
+        .chain(std::iter::once((Slot::MAX, Pubkey::default())))
+        .collect::<SlotPubkeys>();
+
+        let stats = workers.process_batches(
+            &mut batches,
+            Arc::new(SigverifyContext {
+                slot_leaders,
+                root_bank,
+                working_bank,
+                keypair: node_keypair,
+            }),
         );
 
-        // Correctly signed leader shred survives.
+        assert_eq!(stats.num_discards_post, 1);
         assert!(!batches[0].get(0).unwrap().meta().discard());
-
-        // Shred signed by the wrong leader is discarded.
         assert!(batches[0].get(1).unwrap().meta().discard());
     }
 
-    #[test_matrix(
-        [true, false],
-        [true, false]
-    )]
+    #[test_matrix([true, false], [true, false])]
     fn test_resign_packets(repaired: bool, is_last_in_slot: bool) {
         let mut rng = rand::rng();
 
@@ -961,9 +864,7 @@ mod tests {
         let bank = Bank::new_for_tests(
             &create_genesis_config_with_leader(100, &leader_pubkey, 10).genesis_config,
         );
-
         let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-
         let bank_forks = BankForks::new_rw_arc(bank);
 
         let (working_bank, root_bank) = {
@@ -976,17 +877,16 @@ mod tests {
             leader_keypair.clone(),
             SocketAddrSpace::Unspecified,
         ));
-
-        // Keep the same persistent worker pool for every shred in the test.
-        let workers = new_sigverify_workers(cluster_info, leader_schedule_cache, 3);
+        let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
+            CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
+            CLUSTER_NODES_CACHE_TTL,
+        );
 
         let chained_merkle_root = Hash::new_from_array(rng.random());
-
         let shredder = Shredder::new(root_bank.slot(), root_bank.parent_slot(), 0, 0).unwrap();
-
         let entries = vec![Entry::new(&Hash::default(), 0, vec![])];
 
-        let mut shreds: Vec<_> = shredder
+        let shreds: Vec<_> = shredder
             .make_merkle_shreds_from_entries(
                 &leader_keypair,
                 &entries,
@@ -999,15 +899,11 @@ mod tests {
             )
             .collect();
 
-        let stats = ShredSigVerifyStats::new(Instant::now());
-
-        for shred in shreds.iter_mut() {
-            let retransmitter_keypair = Arc::new(Keypair::new());
+        for shred in &shreds {
+            let retransmitter_keypair = Keypair::new();
             let nonce = repaired.then(|| rng.random::<Nonce>());
 
-            // Packet variant.
             let mut packet = shred.payload().to_packet(nonce);
-
             if repaired {
                 packet.meta_mut().flags |= PacketFlags::REPAIR;
             }
@@ -1015,57 +911,64 @@ mod tests {
             let mut packet_batch = RecycledPacketBatch::with_capacity(1);
             packet_batch.push(packet);
 
-            // BytesPacket variant.
             let mut bytes_packet = shred.payload().to_bytes_packet(nonce);
-
             if repaired {
                 bytes_packet.meta_mut().flags |= PacketFlags::REPAIR;
             }
 
             let bytes_buffer_address_before = bytes_packet.buffer().as_ptr().addr();
-
             let mut batches = vec![
                 PacketBatch::from(packet_batch),
                 PacketBatch::Single(bytes_packet),
             ];
-
             let packet_buffer_before = batches[0].get(0).unwrap().data(..).unwrap().to_vec();
 
-            resign_packets(
-                &workers,
-                &mut batches,
-                root_bank.clone(),
-                working_bank.clone(),
-                retransmitter_keypair.clone(),
-                &stats,
-            );
+            let mut worker_stats = SigverifyWorkerStats::default();
+            for batch in &mut batches {
+                let mut packet = batch.get_mut(0).unwrap();
+                maybe_verify_and_resign_packet(
+                    &mut packet,
+                    root_bank.as_ref(),
+                    working_bank.as_ref(),
+                    cluster_info.as_ref(),
+                    leader_schedule_cache.as_ref(),
+                    &cluster_nodes_cache,
+                    &mut worker_stats,
+                    &retransmitter_keypair,
+                )
+                .unwrap();
+            }
 
-            let packet = batches[0].get(0).unwrap();
-            let bytes_packet = batches[1].get(0).unwrap();
+            let packet = batches
+                .iter()
+                .find_map(|batch| match batch {
+                    PacketBatch::Single(_) => None,
+                    batch => batch.get(0),
+                })
+                .unwrap();
+
+            let bytes_packet = batches
+                .iter()
+                .find_map(|batch| match batch {
+                    PacketBatch::Single(packet) => Some(packet),
+                    _ => None,
+                })
+                .unwrap();
 
             assert!(!packet.meta().discard());
             assert!(!bytes_packet.meta().discard());
 
             let packet_buffer_after = packet.data(..).unwrap();
-
-            let bytes_buffer_address_after = match &batches[1] {
-                PacketBatch::Single(packet) => packet.buffer().as_ptr().addr(),
-                _ => unreachable!("expected PacketBatch::Single"),
-            };
+            let bytes_buffer_address_after = bytes_packet.buffer().as_ptr().addr();
 
             if is_last_in_slot {
-                // Resigned variant: both packet representations must be modified.
                 assert_ne!(packet_buffer_before.as_slice(), packet_buffer_after);
                 assert_ne!(bytes_buffer_address_before, bytes_buffer_address_after);
 
-                // More importantly, verify that the new retransmitter
-                // signature is actually valid for the supplied keypair.
                 for batch in &batches {
                     let packet = batch.get(0).unwrap();
                     let shred = get_shred(packet).unwrap();
-
                     let signature = shred::layout::get_retransmitter_signature(shred).unwrap();
-
                     let merkle_root = shred::layout::get_merkle_root(shred).unwrap();
 
                     assert!(signature.verify(
@@ -1074,7 +977,6 @@ mod tests {
                     ));
                 }
             } else {
-                // Non-resigned variant must remain untouched.
                 assert_eq!(packet_buffer_before.as_slice(), packet_buffer_after);
                 assert_eq!(bytes_buffer_address_before, bytes_buffer_address_after);
             }
@@ -1082,25 +984,71 @@ mod tests {
     }
 
     #[test]
+fn test_extract_shred_and_location_bytes_packet_is_zero_copy() {
+    let leader_keypair = Keypair::new();
+
+    let entries = create_ticks(1, 1, Hash::new_unique());
+    let shredder = Shredder::new(1, 0, 1, 0).unwrap();
+
+    let (shreds, _) = shredder.entries_to_merkle_shreds_for_tests(
+        &leader_keypair,
+        &entries,
+        false,
+        Hash::new_unique(),
+        0,
+        0,
+        &ReedSolomonCache::default(),
+        &mut ProcessShredsStats::default(),
+    );
+
+    let bytes_packet = shreds[0].payload().to_bytes_packet(None);
+
+    let buffer_ptr = bytes_packet.buffer().as_ptr();
+
+    let mut stats = ShredSigVerifyStats::new(Instant::now());
+    let repair_nonce_location_lookup = |_| None;
+
+    let (payload, location) = extract_shred_and_location(
+    PacketRef::Bytes(&bytes_packet),
+    &repair_nonce_location_lookup,
+    &mut stats,
+    )
+    .unwrap();
+
+    assert!(location.is_none());
+    assert_eq!(payload.bytes.as_ptr(), buffer_ptr);
+    assert_eq!(
+    payload.bytes.as_ref(),
+    shreds[0].payload().bytes.as_ref()
+);
+
+    assert!(location.is_none());
+    assert_eq!(payload.bytes.as_ptr(), buffer_ptr);
+    assert_eq!(
+    payload.bytes.as_ref(),
+    shreds[0].payload().bytes.as_ref()
+);
+}
+
+    #[test]
     fn test_sigverify_workers_are_reused_across_rounds() {
         let leader_keypair = Arc::new(Keypair::new());
         let wrong_keypair = Keypair::new();
+        let node_keypair = Arc::new(Keypair::new());
         let leader_pubkey = leader_keypair.pubkey();
+        let node_pubkey = node_keypair.pubkey();
 
         let bank = Bank::new_for_tests(
             &create_genesis_config_with_leader(100, &leader_pubkey, 10).genesis_config,
         );
-
         let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-
         let bank_forks = BankForks::new_rw_arc(bank);
 
         let cluster_info = Arc::new(ClusterInfo::new(
-            ContactInfo::new_localhost(&leader_pubkey, timestamp()),
-            leader_keypair.clone(),
+            ContactInfo::new_localhost(&node_pubkey, timestamp()),
+            node_keypair.clone(),
             SocketAddrSpace::Unspecified,
         ));
-
         let workers = new_sigverify_workers(cluster_info, leader_schedule_cache.clone(), 4);
 
         let entries = create_ticks(1, 1, Hash::new_unique());
@@ -1109,7 +1057,7 @@ mod tests {
         let (valid_shreds, _) = shredder.entries_to_merkle_shreds_for_tests(
             &leader_keypair,
             &entries,
-            true,
+            false,
             Hash::new_unique(),
             0,
             0,
@@ -1120,7 +1068,7 @@ mod tests {
         let (invalid_shreds, _) = shredder.entries_to_merkle_shreds_for_tests(
             &wrong_keypair,
             &entries,
-            true,
+            false,
             Hash::new_unique(),
             0,
             0,
@@ -1128,9 +1076,11 @@ mod tests {
             &mut ProcessShredsStats::default(),
         );
 
-        let working_bank = bank_forks.read().unwrap().working_bank();
+        let (working_bank, root_bank) = {
+            let bank_forks = bank_forks.read().unwrap();
+            (bank_forks.working_bank(), bank_forks.root_bank())
+        };
 
-        // Run several independent rounds through the same persistent workers.
         for _ in 0..3 {
             let mut batch = RecycledPacketBatch::with_capacity(5);
             batch.resize(5, Packet::default());
@@ -1148,15 +1098,27 @@ mod tests {
             }
 
             let mut batches = vec![PacketBatch::from(batch)];
-
-            verify_packets(
-                &workers,
-                &Pubkey::new_unique(),
-                &working_bank,
-                leader_schedule_cache.as_ref(),
+            let slot_leaders = get_slot_leaders(
+                &node_pubkey,
                 &mut batches,
+                leader_schedule_cache.as_ref(),
+                &working_bank,
+            )
+            .filter_map(|(slot, pubkey)| pubkey.map(|pubkey| (slot, pubkey)))
+            .chain(std::iter::once((Slot::MAX, Pubkey::default())))
+            .collect::<SlotPubkeys>();
+
+            let stats = workers.process_batches(
+                &mut batches,
+                Arc::new(SigverifyContext {
+                    slot_leaders,
+                    root_bank: root_bank.clone(),
+                    working_bank: working_bank.clone(),
+                    keypair: node_keypair.clone(),
+                }),
             );
 
+            assert_eq!(stats.num_discards_post, 2);
             assert!(!batches[0].get(0).unwrap().meta().discard());
             assert!(batches[0].get(1).unwrap().meta().discard());
             assert!(!batches[0].get(2).unwrap().meta().discard());
