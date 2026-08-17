@@ -11,13 +11,17 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
-        genesis_utils::create_genesis_config_with_leader,
-        leader_schedule_cache::LeaderScheduleCache,
-        shred::{
-            DATA_SHREDS_PER_FEC_BLOCK, ProcessShredsStats, ReedSolomonCache, Shredder,
-            get_data_shred_bytes_per_batch_typical, max_ticks_per_n_shreds,
-        },
+    genesis_utils::create_genesis_config_with_leader,
+    leader_schedule_cache::LeaderScheduleCache,
+    shred::{
+        DATA_SHREDS_PER_FEC_BLOCK, ProcessShredsStats, ReedSolomonCache, Shredder,
+        get_data_shred_bytes_per_batch_typical, max_ticks_per_n_shreds,
     },
+    sigverify_shreds::{
+        reset_sigverify_debug_counters,
+        sigverify_debug_counters,
+    },
+},
     solana_net_utils::SocketAddrSpace,
     solana_perf::packet::{Packet, PacketBatch, RecycledPacketBatch},
     solana_runtime::{bank::Bank, bank_forks::BankForks},
@@ -383,6 +387,8 @@ fn main() {
 
     let repair_nonce_location_lookup: Arc<RepairNonceLocationLookup> = Arc::new(|_| None);
 
+    reset_sigverify_debug_counters();
+
     // Worker creation is outside the measured section.
     let sigverify_handle = spawn_shred_sigverify(
         cluster_info,
@@ -422,12 +428,30 @@ fn main() {
     drop(shred_fetch_sender);
 
     sigverify_handle
-        .join()
-        .expect("shred sigverify thread panicked");
+    .join()
+    .expect("shred sigverify thread panicked");
 
     let verified_shreds = verified_handle
         .join()
         .expect("verified shred consumer panicked");
+
+    let debug = sigverify_debug_counters();
+
+    println!(
+        "CRYPTO COUNTERS: \
+        verify_calls={} \
+        precrypto_rejects={} \
+        cache_hits={} \
+        crypto_calls={} \
+        crypto_success={} \
+        crypto_failed={}",
+        debug.verify_calls,
+        debug.precrypto_rejects,
+        debug.cache_hits,
+        debug.crypto_calls,
+        debug.crypto_success,
+        debug.crypto_failed,
+    );
 
     perf.disable();
 
