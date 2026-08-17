@@ -233,6 +233,10 @@ name = "sigverify_stage"
 harness = false
 
 [[bench]]
+name = "shred_sigverify"
+harness = false
+
+[[bench]]
 name = "shredder"
 harness = false
 
