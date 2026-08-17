@@ -8,7 +8,13 @@ use {
     solana_perf::packet::{PacketBatch, PacketRef},
     solana_pubkey::Pubkey,
     solana_signature::Signature,
-    std::{collections::HashMap, sync::RwLock},
+    std::{
+        collections::HashMap,
+        sync::{
+            RwLock,
+            atomic::{AtomicUsize, Ordering},
+        },
+    },
 };
 #[cfg(test)]
 use {solana_keypair::Keypair, solana_perf::packet::PacketRefMut, solana_signer::Signer};
@@ -17,40 +23,90 @@ pub type LruCache = lazy_lru::LruCache<(Signature, Pubkey, /*merkle root:*/ Hash
 
 pub type SlotPubkeys = HashMap<Slot, Pubkey, BuildNoHashHasher<Slot>>;
 
+static DEBUG_VERIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DEBUG_PRECRYPTO_REJECTS: AtomicUsize = AtomicUsize::new(0);
+static DEBUG_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+static DEBUG_CRYPTO_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DEBUG_CRYPTO_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+static DEBUG_CRYPTO_FAILED: AtomicUsize = AtomicUsize::new(0);
+
+pub struct SigverifyDebugCounters {
+    pub verify_calls: usize,
+    pub precrypto_rejects: usize,
+    pub cache_hits: usize,
+    pub crypto_calls: usize,
+    pub crypto_success: usize,
+    pub crypto_failed: usize,
+}
+
+pub fn reset_sigverify_debug_counters() {
+    DEBUG_VERIFY_CALLS.store(0, Ordering::Relaxed);
+    DEBUG_PRECRYPTO_REJECTS.store(0, Ordering::Relaxed);
+    DEBUG_CACHE_HITS.store(0, Ordering::Relaxed);
+    DEBUG_CRYPTO_CALLS.store(0, Ordering::Relaxed);
+    DEBUG_CRYPTO_SUCCESS.store(0, Ordering::Relaxed);
+    DEBUG_CRYPTO_FAILED.store(0, Ordering::Relaxed);
+}
+
+pub fn sigverify_debug_counters() -> SigverifyDebugCounters {
+    SigverifyDebugCounters {
+        verify_calls: DEBUG_VERIFY_CALLS.load(Ordering::Relaxed),
+        precrypto_rejects: DEBUG_PRECRYPTO_REJECTS.load(Ordering::Relaxed),
+        cache_hits: DEBUG_CACHE_HITS.load(Ordering::Relaxed),
+        crypto_calls: DEBUG_CRYPTO_CALLS.load(Ordering::Relaxed),
+        crypto_success: DEBUG_CRYPTO_SUCCESS.load(Ordering::Relaxed),
+        crypto_failed: DEBUG_CRYPTO_FAILED.load(Ordering::Relaxed),
+    }
+}
+
 #[must_use]
 pub fn verify_shred_cpu(
     packet: PacketRef,
     slot_leaders: &SlotPubkeys,
     cache: &RwLock<LruCache>,
 ) -> bool {
+    DEBUG_VERIFY_CALLS.fetch_add(1, Ordering::Relaxed);
+
     if packet.meta().discard() {
+        DEBUG_PRECRYPTO_REJECTS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     let Some(shred) = shred::layout::get_shred(packet) else {
+        DEBUG_PRECRYPTO_REJECTS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
     let Some(slot) = shred::layout::get_slot(shred) else {
+        DEBUG_PRECRYPTO_REJECTS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
     trace!("slot {slot}");
     let Some(pubkey) = slot_leaders.get(&slot) else {
+        DEBUG_PRECRYPTO_REJECTS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
     let Some(signature) = shred::layout::get_signature(shred) else {
+        DEBUG_PRECRYPTO_REJECTS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
     trace!("signature {signature}");
     let Some(data) = shred::layout::get_merkle_root(shred) else {
+        DEBUG_PRECRYPTO_REJECTS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
 
     let key = (signature, *pubkey, data);
     if cache.read().unwrap().get(&key).is_some() {
+        DEBUG_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
         true
-    } else if key.0.verify(key.1.as_ref(), key.2.as_ref()) {
+    } else if {
+        DEBUG_CRYPTO_CALLS.fetch_add(1, Ordering::Relaxed);
+        key.0.verify(key.1.as_ref(), key.2.as_ref())
+    } {
+        DEBUG_CRYPTO_SUCCESS.fetch_add(1, Ordering::Relaxed);
         cache.write().unwrap().put(key, ());
         true
     } else {
+        DEBUG_CRYPTO_FAILED.fetch_add(1, Ordering::Relaxed);
         false
     }
 }

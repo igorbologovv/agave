@@ -97,17 +97,24 @@ pub fn spawn_shred_sigverify(
         .thread_name(|i| format!("solSvrfyShred{i:02}"))
         .build()
         .expect("new rayon threadpool");
+
     let run_shred_sigverify = move || {
         let mut rng = rand::rng();
         let deduper = Deduper::<2, [u8]>::new(&mut rng, DEDUPER_NUM_BITS);
         let mut shred_buffer = Vec::with_capacity(SIGVERIFY_SHRED_BATCH_SIZE);
+
+        let mut total_verify_calls = 0usize;
+        let mut total_verify_failed = 0usize;
+
         loop {
             if deduper.maybe_reset(&mut rng, DEDUPER_FALSE_POSITIVE_RATE, DEDUPER_RESET_CYCLE) {
                 stats.num_deduper_saturations += 1;
             }
+
             // We can't store the keypair outside the loop
             // because the identity might be hot swapped.
             let keypair = cluster_info.keypair();
+
             match run_shred_sigverify(
                 &thread_pool,
                 &keypair,
@@ -123,15 +130,25 @@ pub fn spawn_shred_sigverify(
                 &cache,
                 &mut stats,
                 &mut shred_buffer,
+                &mut total_verify_calls,
+                &mut total_verify_failed,
             ) {
                 Ok(()) => (),
                 Err(ShredSigverifyError::RecvTimeout) => (),
                 Err(ShredSigverifyError::RecvDisconnected) => break,
                 Err(ShredSigverifyError::SendError) => break,
             }
+
             stats.maybe_submit();
         }
+
+        eprintln!(
+            "BASELINE TOTAL: verify_calls={} verify_failed={}",
+            total_verify_calls,
+            total_verify_failed,
+        );
     };
+
     Builder::new()
         .name("solShredVerifr".to_string())
         .spawn(run_shred_sigverify)
@@ -154,11 +171,15 @@ fn run_shred_sigverify<const K: usize>(
     cache: &RwLock<LruCache>,
     stats: &mut ShredSigVerifyStats,
     shred_buffer: &mut Vec<PacketBatch>,
+    total_verify_calls: &mut usize,
+    total_verify_failed: &mut usize,
 ) -> Result<(), ShredSigverifyError> {
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
+
     let packets = shred_fetch_receiver.recv_timeout(RECV_TIMEOUT)?;
     stats.num_packets += packets.len();
     shred_buffer.push(packets);
+
     for packets in shred_fetch_receiver
         .try_iter()
         .take(SIGVERIFY_SHRED_BATCH_SIZE - 1)
@@ -168,9 +189,11 @@ fn run_shred_sigverify<const K: usize>(
     }
 
     let now = Instant::now();
+
     stats.num_iters += 1;
     stats.num_batches += shred_buffer.len();
     stats.num_discards_pre += count_discards(shred_buffer);
+
     // Repair shreds include a randomly generated u32 nonce, so it does not
     // make sense to deduplicate the entire packet payload (i.e. they are not
     // duplicate of any other packet.data(..)).
@@ -198,11 +221,13 @@ fn run_shred_sigverify<const K: usize>(
             .map(|mut packet| packet.meta_mut().set_discard(true))
             .count()
     });
+
     let (working_bank, root_bank) = {
         let bank_forks = bank_forks.read().unwrap();
         (bank_forks.working_bank(), bank_forks.root_bank())
     };
-    verify_packets(
+
+    let (verify_calls, verify_failed) = verify_packets(
         thread_pool,
         &keypair.pubkey(),
         &working_bank,
@@ -210,10 +235,16 @@ fn run_shred_sigverify<const K: usize>(
         shred_buffer,
         cache,
     );
+
+    *total_verify_calls += verify_calls;
+    *total_verify_failed += verify_failed;
+
     stats.num_discards_post += count_discards(shred_buffer);
+
     // Verify retransmitter's signature, and resign shreds
     // Merkle root as the retransmitter node.
     let resign_start = Instant::now();
+
     thread_pool.install(|| {
         shred_buffer
             .par_iter_mut()
@@ -236,7 +267,9 @@ fn run_shred_sigverify<const K: usize>(
                 }
             })
     });
+
     stats.resign_micros += resign_start.elapsed().as_micros() as u64;
+
     // Extract shred payload from packets, and separate out repaired shreds.
     let (shreds, repairs): (Vec<_>, Vec<_>) = shred_buffer
         .iter()
@@ -263,6 +296,7 @@ fn run_shred_sigverify<const K: usize>(
 
     // Repaired shreds are not retransmitted.
     stats.num_retransmit_shreds += shreds.len();
+
     if let Err(send_err) = retransmit_sender.try_send(shreds.clone()) {
         match send_err {
             crossbeam_channel::TrySendError::Full(v) => {
@@ -271,13 +305,17 @@ fn run_shred_sigverify<const K: usize>(
             _ => unreachable!("EvictingSender holds on to both ends of the channel"),
         }
     }
+
     // Send all shreds to window service to be inserted into blockstore.
     let shreds = shreds
         .into_iter()
         .map(|shred| (shred, /*is_repaired:*/ false, BlockLocation::Original));
+
     verified_sender.send(shreds.chain(repairs).collect())?;
+
     stats.elapsed_micros += now.elapsed().as_micros() as u64;
     shred_buffer.clear();
+
     Ok(())
 }
 
@@ -421,14 +459,40 @@ fn verify_packets(
     leader_schedule_cache: &LeaderScheduleCache,
     packets: &mut [PacketBatch],
     cache: &RwLock<LruCache>,
-) {
+) -> (usize, usize) {
     let leader_slots: SlotPubkeys =
         get_slot_leaders(self_pubkey, packets, leader_schedule_cache, working_bank)
             .filter_map(|(slot, pubkey)| Some((slot, pubkey?)))
             .chain(std::iter::once((Slot::MAX, Pubkey::default())))
             .collect();
+
+    // Count packets which actually enter verification after all
+    // pre-verification discard decisions.
+    let verify_calls = packets
+        .iter()
+        .flat_map(|batch| batch.iter())
+        .filter(|packet| !packet.meta().discard())
+        .count();
+
     let out = verify_shreds(thread_pool, packets, &leader_slots, cache);
+
+    // Must be counted before mark_disabled(), because mark_disabled()
+    // converts failed verification results into packet discard flags.
+    let verify_failed = packets
+        .iter()
+        .zip(out.iter())
+        .map(|(batch, results)| {
+            batch
+                .iter()
+                .zip(results.iter())
+                .filter(|(packet, result)| !packet.meta().discard() && **result == 0)
+                .count()
+        })
+        .sum();
+
     solana_perf::sigverify::mark_disabled(packets, &out);
+
+    (verify_calls, verify_failed)
 }
 
 // Returns pubkey of leaders for shred slots referenced in the packets.
