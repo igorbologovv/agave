@@ -74,6 +74,7 @@ impl Display for ReplayMode {
 enum ArrivalDistribution {
     EvenlySpaced,
     UniformRandom,
+    Burst,
 }
 
 impl Display for ArrivalDistribution {
@@ -81,6 +82,7 @@ impl Display for ArrivalDistribution {
         formatter.write_str(match self {
             Self::EvenlySpaced => "evenly-spaced",
             Self::UniformRandom => "uniform-random",
+            Self::Burst => "burst",
         })
     }
 }
@@ -94,6 +96,7 @@ struct Args {
     shreds_per_slot: usize,
     invalid_per_slot: usize,
     arrival_seed: u64,
+    profile_delay_ms: u64,
     threads: Option<NonZeroUsize>,
 }
 
@@ -113,9 +116,9 @@ impl Args {
                 Arg::with_name("distribution")
                     .long("distribution")
                     .takes_value(true)
-                    .possible_values(&["evenly-spaced", "uniform-random"])
+                    .possible_values(&["evenly-spaced", "uniform-random", "burst"])
                     .default_value("evenly-spaced")
-                    .help("Distribution of shred arrival times within each slot"),
+                    .help("Distribution of shred arrival times within each slot; burst emits a whole slot at once"),
             )
             .arg(
                 Arg::with_name("slots")
@@ -153,6 +156,14 @@ impl Args {
                     .help("Seed for random arrival times (default: 1)"),
             )
             .arg(
+                Arg::with_name("profile-delay-ms")
+                    .long("profile-delay-ms")
+                    .takes_value(true)
+                    .value_name("MILLISECONDS")
+                    .default_value("0")
+                    .help("Delay after workload generation so a profiler can attach"),
+            )
+            .arg(
                 Arg::with_name("threads")
                     .long("threads")
                     .takes_value(true)
@@ -170,6 +181,7 @@ impl Args {
             distribution: match matches.value_of("distribution") {
                 Some("evenly-spaced") => ArrivalDistribution::EvenlySpaced,
                 Some("uniform-random") => ArrivalDistribution::UniformRandom,
+                Some("burst") => ArrivalDistribution::Burst,
                 _ => unreachable!("clap validates --distribution"),
             },
             slots: parse_optional(&matches, "slots")?.unwrap_or(DEFAULT_NUM_SLOTS),
@@ -180,6 +192,7 @@ impl Args {
             invalid_per_slot: parse_optional(&matches, "invalid-per-slot")?
                 .unwrap_or(DEFAULT_INVALID_PACKETS_PER_SLOT),
             arrival_seed: parse_optional(&matches, "arrival-seed")?.unwrap_or(DEFAULT_ARRIVAL_SEED),
+            profile_delay_ms: parse_optional(&matches, "profile-delay-ms")?.unwrap_or(0),
             threads: parse_optional(&matches, "threads")?,
         })
     }
@@ -213,6 +226,7 @@ struct HarnessConfig {
     shreds_per_slot: usize,
     invalid_packets_per_slot: usize,
     arrival_seed: u64,
+    profile_delay: Duration,
     num_sigverify_threads: NonZeroUsize,
     expected_shreds: usize,
     expected_invalid_shreds: usize,
@@ -272,6 +286,7 @@ impl HarnessConfig {
             shreds_per_slot: args.shreds_per_slot,
             invalid_packets_per_slot: args.invalid_per_slot,
             arrival_seed: args.arrival_seed,
+            profile_delay: Duration::from_millis(args.profile_delay_ms),
             num_sigverify_threads,
             expected_shreds,
             expected_invalid_shreds,
@@ -326,7 +341,8 @@ impl Display for HarnessConfig {
             self.expected_valid_shreds
         )?;
         writeln!(formatter, "  maximum per slot:     {MAX_SHREDS_PER_SLOT}")?;
-        write!(formatter, "  arrival seed:         {}", self.arrival_seed)
+        writeln!(formatter, "  arrival seed:         {}", self.arrival_seed)?;
+        write!(formatter, "  profile delay:        {:?}", self.profile_delay)
     }
 }
 
@@ -673,6 +689,10 @@ fn slot_arrival_offsets(
         ArrivalDistribution::UniformRandom => {
             uniform_random_arrival_offsets(slot_duration, shreds_per_slot, rng)
         }
+        // All shreds for the source slot arrive together. With paced replay this
+        // creates a burst of PacketBatch jobs followed by an idle gap, forcing
+        // sigverify workers through recv -> sleep -> wake cycles repeatedly.
+        ArrivalDistribution::Burst => vec![Duration::ZERO; shreds_per_slot],
     }
 }
 
@@ -1000,6 +1020,10 @@ fn main() {
         "Shred sigverify workload ready; attach profiler to pid {}\n",
         std::process::id()
     );
+
+    if !config.profile_delay.is_zero() {
+        thread::sleep(config.profile_delay);
+    }
 
     let result = run_sigverify(&config, &leader_keypair, workload);
     let nominal_replay = duration_mul(config.slot_duration, config.num_slots);
