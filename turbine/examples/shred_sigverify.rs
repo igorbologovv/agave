@@ -31,7 +31,10 @@ use {
     solana_time_utils::timestamp,
     solana_turbine::sigverify_shreds::{RepairNonceLocationLookup, spawn_shred_sigverify},
     std::{
+        env,
         fmt::{self, Display, Formatter},
+        fs::{File, OpenOptions},
+        io::{BufRead, BufReader, Write},
         num::NonZeroUsize,
         sync::Arc,
         thread,
@@ -54,6 +57,13 @@ const DEFAULT_ARRIVAL_SEED: u64 = 1;
 
 const MAX_SHREDS_PER_SLOT: usize = MAX_DATA_SHREDS_PER_SLOT + MAX_CODE_SHREDS_PER_SLOT;
 const FIRST_SLOT: u64 = 1;
+
+// The synthetic bank used by this harness only has a limited leader-schedule
+// horizon. Long profiling runs should repeat wake/sleep workload cycles without
+// advancing shred slot numbers beyond that horizon. Packet contents are still
+// regenerated for every replay iteration, so reusing slot IDs does not reuse
+// identical shred payloads.
+const SYNTHETIC_SLOT_CYCLE: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 enum ReplayMode {
@@ -96,7 +106,6 @@ struct Args {
     shreds_per_slot: usize,
     invalid_per_slot: usize,
     arrival_seed: u64,
-    profile_delay_ms: u64,
     threads: Option<NonZeroUsize>,
 }
 
@@ -156,14 +165,6 @@ impl Args {
                     .help("Seed for random arrival times (default: 1)"),
             )
             .arg(
-                Arg::with_name("profile-delay-ms")
-                    .long("profile-delay-ms")
-                    .takes_value(true)
-                    .value_name("MILLISECONDS")
-                    .default_value("0")
-                    .help("Delay after workload generation so a profiler can attach"),
-            )
-            .arg(
                 Arg::with_name("threads")
                     .long("threads")
                     .takes_value(true)
@@ -192,7 +193,6 @@ impl Args {
             invalid_per_slot: parse_optional(&matches, "invalid-per-slot")?
                 .unwrap_or(DEFAULT_INVALID_PACKETS_PER_SLOT),
             arrival_seed: parse_optional(&matches, "arrival-seed")?.unwrap_or(DEFAULT_ARRIVAL_SEED),
-            profile_delay_ms: parse_optional(&matches, "profile-delay-ms")?.unwrap_or(0),
             threads: parse_optional(&matches, "threads")?,
         })
     }
@@ -226,7 +226,6 @@ struct HarnessConfig {
     shreds_per_slot: usize,
     invalid_packets_per_slot: usize,
     arrival_seed: u64,
-    profile_delay: Duration,
     num_sigverify_threads: NonZeroUsize,
     expected_shreds: usize,
     expected_invalid_shreds: usize,
@@ -286,7 +285,6 @@ impl HarnessConfig {
             shreds_per_slot: args.shreds_per_slot,
             invalid_packets_per_slot: args.invalid_per_slot,
             arrival_seed: args.arrival_seed,
-            profile_delay: Duration::from_millis(args.profile_delay_ms),
             num_sigverify_threads,
             expected_shreds,
             expected_invalid_shreds,
@@ -341,13 +339,89 @@ impl Display for HarnessConfig {
             self.expected_valid_shreds
         )?;
         writeln!(formatter, "  maximum per slot:     {MAX_SHREDS_PER_SLOT}")?;
-        writeln!(formatter, "  arrival seed:         {}", self.arrival_seed)?;
-        write!(formatter, "  profile delay:        {:?}", self.profile_delay)
+        write!(formatter, "  arrival seed:         {}", self.arrival_seed)
     }
 }
 
 fn argument_error(message: impl Into<String>) -> clap::Error {
     clap::Error::with_description(&message.into(), ErrorKind::ValueValidation)
+}
+
+struct PerfControl {
+    control: Option<File>,
+    ack: Option<BufReader<File>>,
+}
+
+impl PerfControl {
+    fn from_env() -> Self {
+        let control_path = env::var_os("PERF_CTL_FIFO");
+        let ack_path = env::var_os("PERF_CTL_ACK_FIFO");
+
+        assert!(
+            control_path.is_some() || ack_path.is_none(),
+            "PERF_CTL_ACK_FIFO requires PERF_CTL_FIFO"
+        );
+
+        let control = control_path.map(|path| {
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to open PERF_CTL_FIFO {}: {error}",
+                        std::path::Path::new(&path).display()
+                    )
+                })
+        });
+
+        let ack = ack_path.map(|path| {
+            BufReader::new(
+                OpenOptions::new()
+                    .read(true)
+                    .open(&path)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "failed to open PERF_CTL_ACK_FIFO {}: {error}",
+                            std::path::Path::new(&path).display()
+                        )
+                    }),
+            )
+        });
+
+        Self { control, ack }
+    }
+
+    fn command(&mut self, command: &str) {
+        let Some(control) = self.control.as_mut() else {
+            return;
+        };
+
+        writeln!(control, "{command}").expect("failed to write perf control command");
+        control.flush().expect("failed to flush perf control command");
+
+        if let Some(ack) = self.ack.as_mut() {
+            let mut response = String::new();
+            let bytes = ack
+                .read_line(&mut response)
+                .expect("failed to read perf control acknowledgement");
+            assert!(bytes > 0, "perf control acknowledgement FIFO closed");
+
+            let response =
+                response.trim_matches(|character: char| character == '\0' || character.is_whitespace());
+            assert_eq!(
+                response, "ack",
+                "unexpected perf control acknowledgement: {response:?}"
+            );
+        }
+    }
+
+    fn enable(&mut self) {
+        self.command("enable");
+    }
+
+    fn disable(&mut self) {
+        self.command("disable");
+    }
 }
 
 struct ReplayResult {
@@ -785,8 +859,16 @@ fn make_workload(leader_keypair: &Keypair, config: &HarnessConfig) -> Vec<Schedu
     let mut coalescer = BatchCoalescer::new(config.expected_shreds);
 
     for slot_offset in 0..config.num_slots {
+        // Replay time keeps increasing for the full benchmark, but actual shred
+        // slot IDs cycle through a range that stays inside the synthetic bank's
+        // leader schedule. This lets --slots control benchmark duration rather
+        // than accidentally extending the validator's synthetic chain.
+        let synthetic_slot_offset = slot_offset % SYNTHETIC_SLOT_CYCLE;
         let slot = FIRST_SLOT
-            .checked_add(u64::try_from(slot_offset).expect("slot offset does not fit in u64"))
+            .checked_add(
+                u64::try_from(synthetic_slot_offset)
+                    .expect("synthetic slot offset does not fit in u64"),
+            )
             .expect("slot number overflowed");
         let slot_start = duration_mul(config.slot_duration, slot_offset);
 
@@ -845,6 +927,7 @@ fn run_sigverify(
     config: &HarnessConfig,
     leader_keypair: &Keypair,
     workload: Vec<ScheduledBatch>,
+    perf: &mut PerfControl,
 ) -> ReplayResult {
     let leader_pubkey = leader_keypair.pubkey();
 
@@ -896,6 +979,9 @@ fn run_sigverify(
         config.num_sigverify_threads,
     );
 
+    // perf counters start exactly at the measured replay boundary. With an ACK
+    // FIFO configured, this does not return until perf confirms counters are on.
+    perf.enable();
     let replay_start = Instant::now();
     let mut sent_shreds = 0usize;
     let mut overflow_shreds = 0usize;
@@ -946,6 +1032,10 @@ fn run_sigverify(
         .join()
         .expect("verified shred consumer panicked");
     let end_to_end_elapsed = replay_start.elapsed();
+
+    // Include the full replay plus sigverify/output drain, then stop counters
+    // before benchmark validation and reporting. ACK makes the boundary exact.
+    perf.disable();
 
     assert!(
         verified_shreds <= config.expected_valid_shreds,
@@ -1017,15 +1107,14 @@ fn main() {
     );
 
     println!(
-        "Shred sigverify workload ready; attach profiler to pid {}\n",
+        "Shred sigverify workload ready; measured replay starts after perf enable ACK (pid {})\n",
         std::process::id()
     );
 
-    if !config.profile_delay.is_zero() {
-        thread::sleep(config.profile_delay);
-    }
-
-    let result = run_sigverify(&config, &leader_keypair, workload);
+    // Opening the FIFOs and all workload/setup work happen while perf counters
+    // are disabled. If PERF_CTL_FIFO is unset, these calls are no-ops.
+    let mut perf = PerfControl::from_env();
+    let result = run_sigverify(&config, &leader_keypair, workload, &mut perf);
     let nominal_replay = duration_mul(config.slot_duration, config.num_slots);
 
     println!(
