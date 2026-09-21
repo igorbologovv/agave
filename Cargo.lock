@@ -11484,6 +11484,7 @@ dependencies = [
  "agave-logger",
  "agave-votor",
  "agave-votor-messages",
+ "agave-wake-channel",
  "assert_matches",
  "bencher",
  "bs58",

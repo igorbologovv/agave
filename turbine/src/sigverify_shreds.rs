@@ -4,6 +4,7 @@ use {
         retransmit_stage::RetransmitStage,
     },
     agave_feature_set as feature_set,
+    agave_wake_channel::{Receiver as WakeReceiver, Sender as WakeSender, bounded as wake_bounded},
     crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender, bounded},
     scopeguard::defer,
     solana_clock::Slot,
@@ -228,8 +229,8 @@ struct ShredSigverifyWorkers {
     // 1. Disconnect the job channel so workers stop receiving new work.
     // 2. Disconnect the result channel so workers cannot block sending results.
     // 3. Drop WorkerHandles, whose Drop impl joins all worker threads.
-    job_sender: Sender<BatchJob>,
-    result_receiver: Receiver<WorkerResult>,
+    job_sender: WakeSender<BatchJob>,
+    result_receiver: WakeReceiver<WorkerResult>,
     _worker_handles: WorkerHandles,
 }
 
@@ -243,8 +244,9 @@ impl ShredSigverifyWorkers {
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         cluster_nodes_cache: Arc<ClusterNodesCache<RetransmitStage>>,
     ) -> Self {
-        let (job_sender, job_receiver) = bounded::<BatchJob>(SIGVERIFY_SHRED_BATCH_SIZE);
-        let (result_sender, result_receiver) = bounded::<WorkerResult>(SIGVERIFY_SHRED_BATCH_SIZE);
+        let (job_sender, job_receiver) = wake_bounded::<BatchJob>(SIGVERIFY_SHRED_BATCH_SIZE);
+        let (result_sender, result_receiver) =
+            wake_bounded::<WorkerResult>(SIGVERIFY_SHRED_BATCH_SIZE);
 
         // Keep cheap lock-free handles to the current root and working banks.
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
