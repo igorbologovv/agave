@@ -264,6 +264,156 @@ mod tests {
     }
 }
 
+#[cfg(all(test, not(feature = "shuttle-test")))]
+mod stress_tests {
+    use {
+        super::*,
+        std::{
+            sync::{
+                Arc, Barrier,
+                atomic::{AtomicUsize, Ordering},
+            },
+            thread,
+        },
+    };
+
+    #[test]
+    fn test_repeated_sleep_wake() {
+        const NUM_RECEIVERS: usize = 4;
+        const NUM_ROUNDS: usize = 1_000;
+
+        let (sender, receiver) = bounded::<usize>(NUM_RECEIVERS);
+        let barrier = Arc::new(Barrier::new(NUM_RECEIVERS + 1));
+        let received = Arc::new(AtomicUsize::new(0));
+
+        let handles = (0..NUM_RECEIVERS)
+            .map(|_| {
+                let receiver = receiver.clone();
+                let barrier = Arc::clone(&barrier);
+                let received = Arc::clone(&received);
+
+                thread::spawn(move || {
+                    for _ in 0..NUM_ROUNDS {
+                        receiver.recv().unwrap();
+                        received.fetch_add(1, Ordering::Relaxed);
+                        barrier.wait();
+                    }
+
+                    // Dropping the last sender must wake sleeping receivers,
+                    // which should then observe channel disconnection.
+                    assert!(receiver.recv().is_err());
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for round in 0..NUM_ROUNDS {
+            // Make sure all receivers are actually sleeping before sending
+            // the next batch. This forces repeated sleep -> wake cycles.
+            while receiver.shared.wake_event.waiters.load(Ordering::Relaxed) != NUM_RECEIVERS {
+                thread::yield_now();
+            }
+
+            for index in 0..NUM_RECEIVERS {
+                sender.send(round * NUM_RECEIVERS + index).unwrap();
+            }
+
+            // Do not start another round until every receiver consumed
+            // exactly one message from this round.
+            barrier.wait();
+        }
+
+        drop(sender);
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(received.load(Ordering::Relaxed), NUM_RECEIVERS * NUM_ROUNDS,);
+    }
+
+    #[test]
+    fn test_multi_sender_multi_receiver_capacity_one() {
+        const NUM_SENDERS: usize = 4;
+        const NUM_RECEIVERS: usize = 4;
+        const NUM_MESSAGES: usize = 100_000;
+
+        // Capacity 1 intentionally forces senders to block frequently.
+        let (sender, receiver) = bounded::<usize>(1);
+
+        let start = Arc::new(Barrier::new(NUM_SENDERS + NUM_RECEIVERS + 1));
+        let received = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(
+            (0..NUM_MESSAGES)
+                .map(|_| AtomicUsize::new(0))
+                .collect::<Vec<_>>(),
+        );
+
+        let receiver_handles = (0..NUM_RECEIVERS)
+            .map(|_| {
+                let receiver = receiver.clone();
+                let start = Arc::clone(&start);
+                let received = Arc::clone(&received);
+                let seen = Arc::clone(&seen);
+
+                thread::spawn(move || {
+                    start.wait();
+
+                    while let Ok(message) = receiver.recv() {
+                        assert!(message < NUM_MESSAGES);
+
+                        let previous = seen[message].fetch_add(1, Ordering::Relaxed);
+
+                        assert_eq!(previous, 0, "message {message} received more than once",);
+
+                        received.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let sender_handles = (0..NUM_SENDERS)
+            .map(|sender_index| {
+                let sender = sender.clone();
+                let start = Arc::clone(&start);
+
+                thread::spawn(move || {
+                    start.wait();
+
+                    for message in (sender_index..NUM_MESSAGES).step_by(NUM_SENDERS) {
+                        sender.send(message).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // Only the sender handles above should keep the channel connected.
+        drop(sender);
+        drop(receiver);
+
+        start.wait();
+
+        for handle in sender_handles {
+            handle.join().unwrap();
+        }
+
+        // Dropping the last sender must wake any sleeping receivers so they
+        // observe disconnection and exit their recv loops.
+        for handle in receiver_handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(received.load(Ordering::Relaxed), NUM_MESSAGES,);
+
+        for (message, count) in seen.iter().enumerate() {
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                1,
+                "message {message} was not received exactly once",
+            );
+        }
+    }
+}
+
 #[cfg(all(test, feature = "shuttle-test"))]
 mod shuttle_tests {
     use {super::*, shuttle::thread};
